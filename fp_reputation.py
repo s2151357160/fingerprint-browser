@@ -175,6 +175,8 @@ class ReputationStore:
 
     def same_country_names(self, all_names: list[str], country: str) -> list[str]:
         """与指定国家同国的节点名（未扫描国家信息的节点排除）"""
+        if not country:
+            return []   # 空国家参数：不匹配任何节点（含未扫描的 country="" 节点）
         with self._lock:
             return [n for n in all_names
                     if (self._data.get(n) or {}).get("country", "").upper() == country.upper()]
