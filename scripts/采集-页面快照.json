@@ -1,0 +1,36 @@
+{
+  "desc": "按规则抽取页面数据并导出 xlsx",
+  "actions": [
+    {
+      "type": "goto",
+      "url": "${url}"
+    },
+    {
+      "type": "wait",
+      "ms": 2500
+    },
+    {
+      "type": "extract",
+      "rules": [
+        {
+          "name": "标题",
+          "css": "h1",
+          "attr": "text"
+        },
+        {
+          "name": "链接",
+          "css": "main a",
+          "attr": "href",
+          "many": true
+        }
+      ],
+      "save": "captured"
+    },
+    {
+      "type": "export",
+      "source": "captured",
+      "fmt": "xlsx",
+      "title": "${url}"
+    }
+  ]
+}

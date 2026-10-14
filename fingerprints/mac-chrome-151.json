@@ -1,0 +1,21 @@
+{
+  "name": "mac-chrome-151",
+  "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "platform": "MacIntel",
+  "ch_platform": "macOS",
+  "platform_version": "14.7.1",
+  "locale": "zh-CN",
+  "languages": ["zh-CN", "zh"],
+  "timezone": "Asia/Shanghai",
+  "screen": {"width": 1440, "height": 900, "dpr": 2.0},
+  "viewport": {"width": 1440, "height": 834},
+  "cores": 5,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "mac-51e9f8",
+  "webgl_vendor": "Apple Inc.",
+  "webgl_renderer": "Apple GPU",
+  "webgl_max_texture": 16384,
+  "fonts": ["PingFang SC", "Helvetica Neue", "Arial"],
+  "note": "macOS 指纹在 Windows 宿主上有字体层限制（系统字体为 Windows 字体）"
+}

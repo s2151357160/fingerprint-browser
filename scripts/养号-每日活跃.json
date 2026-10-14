@@ -1,0 +1,40 @@
+{
+  "desc": "每日养号示例：打开主页 → 随机滚动浏览 → 停留 → 保存登录态（不换 IP）",
+  "actions": [
+    {
+      "type": "log",
+      "message": "开始每日活跃（养号）"
+    },
+    {
+      "type": "goto",
+      "url": "https://x.com/home"
+    },
+    {
+      "type": "wait",
+      "ms": 3000
+    },
+    {
+      "type": "scroll",
+      "to": "bottom"
+    },
+    {
+      "type": "wait",
+      "ms": 2500
+    },
+    {
+      "type": "scroll",
+      "to": "top"
+    },
+    {
+      "type": "wait",
+      "ms": 2000
+    },
+    {
+      "type": "save_state"
+    },
+    {
+      "type": "log",
+      "message": "养号完成"
+    }
+  ]
+}

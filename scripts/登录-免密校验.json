@@ -1,0 +1,22 @@
+{
+  "desc": "打开站点确认登录态（可配合登录后保存的 cookie）",
+  "actions": [
+    {
+      "type": "goto",
+      "url": "https://x.com"
+    },
+    {
+      "type": "wait",
+      "ms": 4000
+    },
+    {
+      "type": "assert",
+      "js": "document.title",
+      "expect": ""
+    },
+    {
+      "type": "log",
+      "message": "页面标题: ${captured.title}"
+    }
+  ]
+}

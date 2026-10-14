@@ -1,0 +1,36 @@
+{
+  "name": "linux-chrome-151",
+  "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "platform": "Linux x86_64",
+  "ch_platform": "Linux",
+  "platform_version": "6.8.0",
+  "locale": "en-US",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "timezone": "Europe/Berlin",
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "dpr": 1.0
+  },
+  "viewport": {
+    "width": 1920,
+    "height": 950
+  },
+  "cores": 8,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "linux-1b6d52",
+  "webgl_vendor": "Google Inc. (NVIDIA)",
+  "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060, Vulkan 1.3.0)",
+  "webgl_max_texture": 16384,
+  "fonts": [
+    "Noto Sans CJK SC",
+    "DejaVu Sans",
+    "Liberation Sans"
+  ],
+  "desc": "Linux 桌面 Chrome；宿主为 Windows，系统字体层有差异风险",
+  "experimental": true
+}

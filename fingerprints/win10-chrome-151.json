@@ -1,0 +1,20 @@
+{
+  "name": "win10-chrome-151",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "platform": "Win32",
+  "ch_platform": "Windows",
+  "platform_version": "13.0.0",
+  "locale": "zh-CN",
+  "languages": ["zh-CN", "zh"],
+  "timezone": "Asia/Shanghai",
+  "screen": {"width": 1920, "height": 1080, "dpr": 1.0},
+  "viewport": {"width": 1920, "height": 969},
+  "cores": 8,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "fp-7f3a9c",
+  "webgl_vendor": "Google Inc. (NVIDIA)",
+  "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "webgl_max_texture": 16384,
+  "fonts": ["Segoe UI", "Microsoft YaHei", "Arial"]
+}

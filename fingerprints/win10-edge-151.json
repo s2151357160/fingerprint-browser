@@ -1,0 +1,36 @@
+{
+  "name": "win10-edge-151",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
+  "platform": "Win32",
+  "ch_platform": "Windows",
+  "platform_version": "13.0.0",
+  "locale": "zh-CN",
+  "languages": [
+    "zh-CN",
+    "zh",
+    "en-US",
+    "en"
+  ],
+  "timezone": "Asia/Shanghai",
+  "screen": {
+    "width": 1366,
+    "height": 768,
+    "dpr": 1.0
+  },
+  "viewport": {
+    "width": 1366,
+    "height": 625
+  },
+  "cores": 6,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "edge-4a1f77",
+  "webgl_vendor": "Google Inc. (Intel)",
+  "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "webgl_max_texture": 16384,
+  "fonts": [
+    "Segoe UI",
+    "Microsoft YaHei",
+    "Arial"
+  ]
+}

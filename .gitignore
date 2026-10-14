@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行时产物
+logs/
+schedules.json
+
+# 外部内核二进制（58MB，单独下载，不入库）
+core/
+
+# 系统杂项
+Thumbs.db
+desktop.ini

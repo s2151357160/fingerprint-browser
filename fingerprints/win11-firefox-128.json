@@ -1,0 +1,38 @@
+{
+  "name": "win11-firefox-128",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+  "platform": "Win32",
+  "ch_platform": "Windows",
+  "locale": "en-US",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "timezone": "Asia/Shanghai",
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "dpr": 1.0
+  },
+  "viewport": {
+    "width": 1920,
+    "height": 955
+  },
+  "cores": 8,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "fx128-9d01aa",
+  "webgl_vendor": "Google Inc. (NVIDIA)",
+  "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "webgl_max_texture": 16384,
+  "fonts": [
+    "Segoe UI",
+    "Microsoft YaHei",
+    "Arial"
+  ],
+  "vendor": "",
+  "chrome_ui": false,
+  "uad": false,
+  "desc": "Firefox 风格（实验性）：Chromium 内核模拟 Firefox UA/无 chrome 对象/无 userAgentData；渲染内核仍为 Chromium，检测者可从内核行为区分",
+  "experimental": true
+}

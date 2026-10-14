@@ -1,0 +1,37 @@
+{
+  "name": "macos-chrome-151",
+  "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "platform": "MacIntel",
+  "ch_platform": "macOS",
+  "platform_version": "14.7.1",
+  "locale": "en-US",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "timezone": "America/Los_Angeles",
+  "screen": {
+    "width": 1512,
+    "height": 982,
+    "dpr": 2.0
+  },
+  "viewport": {
+    "width": 1512,
+    "height": 902
+  },
+  "cores": 10,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "mac-151-c8e2",
+  "webgl_vendor": "Apple Inc.",
+  "webgl_renderer": "ANGLE (Apple, Apple M2, OpenGL 4.1)",
+  "webgl_max_texture": 16384,
+  "fonts": [
+    "PingFang SC",
+    "Helvetica Neue",
+    "Arial",
+    "SF Pro Display"
+  ],
+  "desc": "macOS 风格（Intel Mac + Chrome 151）；宿主为 Windows 时字体层有差异风险",
+  "experimental": true
+}
