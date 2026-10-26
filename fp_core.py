@@ -48,6 +48,50 @@ CONFIG_CANDIDATES = [
 SUBS_FILE = Path(__file__).resolve().parent.parent / "subscriptions.txt"
 # 订阅节点缓存（拉取成功即落盘；订阅临时限流/失效时用缓存兑底，节点池不抖动）
 SUBS_CACHE = Path(__file__).resolve().parent.parent / "sub_nodes_cache.yaml"
+# 自定义代理：用户自填的代理服务器（socks5/http/ss/vmess...），
+# 注入节点池后可被绑定/选中 → 浏览器走它 → 目标网站看到该代理出口 IP。
+CUSTOM_PROXIES = Path(__file__).resolve().parent.parent / "custom_proxies.json"
+
+# 自定义代理允许的 mihomo 节点类型（其余类型字段差异大，防止配置非法导致内核启动失败）
+ALLOWED_CUSTOM_TYPES = {
+    "socks5", "socks4", "http", "https", "ss", "shadowsocks",
+    "vmess", "vless", "trojan", "wireguard",
+}
+
+
+def load_custom_proxies() -> list[dict]:
+    """读取 custom_proxies.json 的自定义代理节点。
+
+    文件不存在/损坏返回空。结构：顶层对象带 proxies 数组，或直接是数组。
+    仅校验基础字段（name/server/type/port），账号密码可选，
+    uuid/alterId/sni 等专用字段原样透传。非法条目静默跳过。
+    """
+    try:
+        data = json.loads(CUSTOM_PROXIES.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    if isinstance(data, dict):
+        data = data.get("proxies") or []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for p in data:
+        if not (isinstance(p, dict) and p.get("name") and p.get("server")):
+            continue
+        t = str(p.get("type") or "socks5").lower()
+        if t not in ALLOWED_CUSTOM_TYPES:
+            continue
+        try:
+            port = int(p["port"])
+        except Exception:  # noqa: BLE001
+            continue
+        node = {"name": p["name"], "type": t, "server": p["server"], "port": port}
+        for k in ("username", "password", "uuid", "alterId", "cipher",
+                  "ai", "sni", "skip-cert-verify"):
+            if p.get(k) is not None:
+                node[k] = p[k]
+        out.append(node)
+    return out
 
 
 def read_subscriptions() -> list[str]:
@@ -63,21 +107,40 @@ def fetch_subscription_nodes(url: str, timeout: int = 30) -> list[dict]:
     """下载单个订阅并提取节点（Clash YAML 格式；失败返回空）
 
     携带 clash UA 拿 YAML；机场域名通常可直连，被墙时依次回退
-    系统代理。拉取成功时写入全局缓存（多订阅合并），任一订阅
-    临时 404/限流时由 load_subs_cache() 兑底。
+    系统代理。优先走 fp_http（curl_cffi 官方 TLS 指纹，订阅接口
+    对非浏览器 TLS 的拦截更友好），失败回退 urllib。
+    拉取成功时写入全局缓存（多订阅合并），任一订阅临时 404/限流
+    时由 load_subs_cache() 兑底。
     """
-    import urllib.request
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "clash-verge/1.7.7"})
+    from .fp_http import request as _http_request
+
+    # 订阅本身是 Clash 协议：保持真实 clash UA，仅在 TLS 层做浏览器伪装
+    hdrs = {"User-Agent": "clash-verge/1.7.7"}
     data = None
-    for proxy in (None,
-                  {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}):
+    for proxy in (None, "http://127.0.0.1:7897"):
         try:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler(proxy) if proxy else urllib.request.ProxyHandler({}))
-            with opener.open(req, timeout=timeout) as r:
-                data = r.read()
-            break
+            # 优先 curl_cffi（真实 TLS ClientHello），回退 urllib
+            for use_cf in (True, False):
+                if use_cf:
+                    try:
+                        from curl_cffi import requests as _cf  # noqa: N813
+                        s = _cf.Session(impersonate="chrome131")
+                        resp = s.get(url, headers=hdrs, timeout=timeout, verify=False,
+                                     proxies={"http": proxy, "https": proxy} if proxy else None)
+                        data = resp.content
+                        break
+                    except Exception:  # noqa: BLE001
+                        continue
+                import urllib.request
+                req = urllib.request.Request(url, headers=hdrs)
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+                    if proxy else urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=timeout) as r:
+                    data = r.read()
+                break
+            if data is not None:
+                break
         except Exception:
             continue
     if not data:
@@ -163,6 +226,9 @@ def find_local_nodes() -> list[dict]:
                     and not any(k in str(p["name"]) for k in PLACEHOLDER_KEYS)):
                 seen.add(p["name"])
                 result.append(p)
+
+    # 0) 用户自定义代理（custom_proxies.json）：最高优先，同名不被订阅/Clash 覆盖
+    _merge(load_custom_proxies())
 
     # 1) 订阅源（优先：节点更新、可能含住宅资源）；全部拉取失败时用缓存兜底
     sub_nodes: list[dict] = []

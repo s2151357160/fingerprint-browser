@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .fp_browser import load
 from .fp_gen import random_fingerprint
+from . import fp_secret
 
 PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 
@@ -61,12 +62,76 @@ def list_profiles() -> list[dict]:
         out.append({
             "name": d.name,
             "node": meta.get("node"),
+            "email": meta.get("email", ""),
+            "username": meta.get("username", ""),
+            "tags": meta.get("tags", []),
+            "notes": meta.get("notes", ""),
             "created_at": meta.get("created_at"),
+            "updated_at": meta.get("updated_at"),
             "has_storage": (d / "storage.json").exists(),
             "has_fingerprint": fp_path.exists(),
             "profile_dir": str(d),
         })
     return out
+
+
+_SAFE_FIELDS = ("email", "username", "tags", "notes", "login_selector",
+                "logged_in_selector", "env_country")
+
+
+def update_profile(name: str, *, email: str | None = None, username: str | None = None,
+                   password: str | None = None, tags: list | None = None,
+                   notes: str | None = None, login_selector: str | None = None,
+                   logged_in_selector: str | None = None,
+                   set_bound_node: str | None = None) -> dict:
+    """更新档案业务字段（邮箱/用户名/密码/标签/备注/登录检测选择器）。
+
+    password 经 fp_secret 加密落盘；其余字段明文存 meta.json。
+    传 None 表示不修改该字段；登录检测：login_selector 命中=已退出/需登录，
+    logged_in_selector 命中=仍在登录态。
+    """
+    d = _dir(name)
+    meta = {}
+    try:
+        meta = json.loads((d / "meta.json").read_text("utf-8"))
+    except Exception:
+        pass
+    for field, val in (("email", email), ("username", username),
+                       ("notes", notes), ("login_selector", login_selector),
+                       ("logged_in_selector", logged_in_selector),
+                       ("set_bound_node", set_bound_node)):
+        if val is not None:
+            if field == "set_bound_node":
+                meta["node"] = val
+            else:
+                meta[field] = val
+    if tags is not None:
+        meta["tags"] = [str(t) for t in tags if str(t).strip()][:20]
+    if password is not None:
+        if password:
+            meta["password_enc"] = fp_secret.encrypt(password)
+            meta["has_password"] = True
+        else:
+            # 显式传空 = 清除已存密码
+            meta.pop("password_enc", None)
+            meta.pop("has_password", None)
+    meta["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    (d / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+
+def profile_full(name: str) -> dict:
+    """返回档案完整元信息，含解密后的密码（仅控制台/用户侧展示用）。"""
+    d = _dir(name)
+    meta = {}
+    try:
+        meta = json.loads((d / "meta.json").read_text("utf-8"))
+    except Exception:
+        pass
+    meta["password"] = fp_secret.decrypt(meta.get("password_enc")) if meta.get("password_enc") else None
+    meta.pop("password_enc", None)
+    return {"name": name, "meta": meta}
 
 
 def create_profile(name: str, node: str | None = None) -> dict:

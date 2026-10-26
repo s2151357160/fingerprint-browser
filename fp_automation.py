@@ -26,6 +26,13 @@
   loop        {count, actions[]}            循环
   save_state  {}                            保存登录态
   结束        {stop: true}                 停止会话
+  进阶动作:
+  solve_captcha {kind: turnstile|recaptcha|hcaptcha, sitekey, url, save?, inject?}
+               第三方打码解码并注入 token
+  check_logged_in {selector, save?, warn?, selector?}
+              登录态探测（selector 命中仍在登录）
+  db_save     {source, data: 变量名, dedup_keys?}  采集入库（SQLite 去重）
+  export      新增 webhook=true/false 联动推送
 """
 from __future__ import annotations
 
@@ -39,6 +46,56 @@ from pathlib import Path
 from .fp_scrape import export_items, extract_rules
 
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+
+
+def _inject_captcha(page, kind: str, token: str):
+    """把解码得到的 token 尽量注入页面（Turnstile/hCaptcha/reCAPTCHA）。
+
+    各服务商的注入细节高度依赖其回调约定，这里做通用尽力而为：
+      - 找隐藏响应文本框并写入 token + 触发 input/change
+      - 触发常见回调（cf turnstile 回调 / hcaptcha 校验）
+    失败不报错（token 已在 vars 中，用户可自行处理），仅提示。
+    """
+    import json as _json
+
+    js = r"""
+    (function () {
+      var token = __TOKEN__;
+      var kind = __KIND__;
+      var sels = {
+        turnstile: ['textarea[name="cf-turnstile-response"]', '[name="cf-turnstile-response"]'],
+        recaptcha: ['textarea[name="g-recaptcha-response"]', '[name="g-recaptcha-response"]'],
+        hcaptcha:  ['textarea[name="h-captcha-response"]', '[name^="h-captcha-response"]']
+      };
+      var list = sels[kind] || Object.values(sels).flat();
+      var wrote = 0;
+      list.forEach(function (sel) {
+        document.querySelectorAll(sel).forEach(function (el) {
+          try {
+            var proto = Object.getPrototypeOf(el);
+            var setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (setter) setter.call(el, token); else el.value = token;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            wrote++;
+          } catch (e) {}
+        });
+      });
+      // 触发常见回调（尽力而为，找到谁在监听就调谁）
+      try {
+        var cb = window.__cf_chl_opt && window.__cf_chl_opt.cb;
+        if (typeof cb === 'function') cb();
+      } catch (e) {}
+      try {
+        callChallengeCompleted && (kind.indexOf('hcaptcha') >= 0 || true) && callChallengeCompleted();
+      } catch (e) {}
+      return { wrote: wrote };
+    })()
+    """
+    try:
+        page.evaluate(js.replace("__TOKEN__", _json.dumps(token)).replace("__KIND__", _json.dumps(kind)))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ============================================================ 脚本管理
@@ -204,6 +261,103 @@ def run_script(page, actions: list[dict], log=None, ctx: dict | None = None) -> 
                 else:
                     page.locator(sel).first.fill(text)
                 _log(f"输入 {sel}")
+        elif t == "longpress":
+            # 真实鼠标长按（mousedown → hold → mouseup）：
+            # 微软 WBA / 部分人机验证要求物理按压，JS dispatchEvent 被判定为合成事件而失败。
+            sel = _interp(act.get("selector") or "", vars)
+            hold = _num(act.get("hold")) or 3
+            if sel:
+                loc = page.locator(sel).first
+                loc.scroll_into_view_if_needed()
+                box = loc.bounding_box()
+                if not box:
+                    raise _Fail(f"长按目标不可见: {sel}")
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+            else:
+                cx = float(act.get("px") or 0)
+                cy = float(act.get("py") or 0)
+            # 人类式落地：从旁斜落再定住，保持期间轻微抖动（真实按压力感）
+            page.mouse.move(cx - 40, cy - 20, steps=6)
+            time.sleep(0.25)
+            page.mouse.move(cx, cy, steps=6)
+            time.sleep(0.15)
+            page.mouse.down()
+            if act.get("stable"):
+                # WBA 长按进度环需稳定按压：全程钉死不移动，直到松开
+                time.sleep(max(0.3, hold))
+            else:
+                # 默认微抖（更拟人）
+                t0 = time.time()
+                while time.time() - t0 < max(0.3, hold):
+                    page.mouse.move(cx + random.randint(-1, 1), cy + random.randint(-1, 1))
+                    time.sleep(0.15)
+            page.mouse.up()
+            _log(f"长按 ({int(cx)},{int(cy)}) {hold}s" + ("（稳定）" if act.get("stable") else ""))
+        elif t == "press_probe":
+            # 调试：按下长按目标，持续监测进度环/滑块/activeElement，松开后返回观察结果
+            px = float(act.get("px") or 0)
+            py = float(act.get("py") or 0)
+            max_ms = int(act.get("max_ms") or 6000)
+            page.mouse.move(px - 30, py - 15, steps=5)
+            time.sleep(0.2)
+            page.mouse.move(px, py, steps=5)
+            time.sleep(0.15)
+            page.mouse.down()
+            observed = []
+            t0 = time.time()
+            while (time.time() - t0) * 1000 < max_ms:
+                try:
+                    st = page.evaluate("""(() => {
+                        const active = document.activeElement ? (document.activeElement.tagName + '|' + (document.activeElement.className||'').toString().slice(0,20)) : '';
+                        const prog = document.querySelectorAll('[role=progressbar],[role=slider],[class*=progress],svg[class*=inner],svg[class*=ring],button[aria-label*=hold],button[aria-label*=Hold]').length;
+                        const bodyTxt = (document.body.innerText||'').slice(0,80);
+                        return {active, prog, bodyTxt};
+                    })()""")
+                    observed.append((round((time.time()-t0)*1000), st))
+                except Exception:
+                    break
+                time.sleep(0.4)
+            page.mouse.up()
+            _log(f"press_probe {max_ms}ms 观察 {len(observed)} 次")
+            vars[act.get("save") or "obs"] = observed
+        elif t == "frame_probe":
+            # 跨域验证 iframe（如 hsprotect WBA）内部交互探测：
+            # 遍历 frames，枚举 iframe 内可交互元素并换算成主视口坐标。
+            _log("frame_probe: 探测验证 iframe")
+            try:
+                results = []
+                for fr in page.frames:
+                    if fr is page.main_frame:
+                        continue
+                    try:
+                        # 枚举 iframe 内所有元素（button/img/带pointer区域），安全 selector
+                        els = fr.query_selector_all("button, img, svg, a, [role=button], [aria-label], [role=slider], [class*=hold], [class*=captcha], [class*=slider], [class*=button], [class*=control], [data-testid]")
+                        for el in els:
+                            try:
+                                box = el.bounding_box()
+                                if not box or (box["width"] < 6 or box["height"] < 6):
+                                    continue
+                                info = el.evaluate("""e => {
+                                    const aria = e.getAttribute('aria-label')||'';
+                                    const role = e.getAttribute('role')||'';
+                                    const dt = e.getAttribute('data-testid')||'';
+                                    const txt = (e.textContent||'').trim().slice(0,24);
+                                    const cls = (e.className||'').toString().slice(0,46);
+                                    return {aria, role, dt, txt, cls};
+                                }""")
+                                results.append({"frame": fr.url[:40], "tag": el.evaluate("e => e.tagName").lower(),
+                                                 "x": round(box["x"],1), "y": round(box["y"],1),
+                                                 "w": round(box["width"],1), "h": round(box["height"],1),
+                                                 **info})
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                vars[act.get("save") or "fp"] = results
+                _log(f"frame_probe: 找到 {len(results)} 个候选元素")
+            except Exception as e:
+                _log(f"frame_probe 失败: {e}")
         elif t == "press":
             page.keyboard.press(act.get("key") or "Enter")
         elif t == "scroll":
@@ -221,7 +375,7 @@ def run_script(page, actions: list[dict], log=None, ctx: dict | None = None) -> 
                     page.mouse.wheel(0, _num(act.get("dy")) or 300)
                 time.sleep(0.4)
         elif t == "eval":
-            js = act.get("js") or ""
+            js = _interp(act.get("js") or "", vars)   # 支持 ${var} 插值
             val = page.evaluate(js)
             save = act.get("save")
             if save:
@@ -242,12 +396,116 @@ def run_script(page, actions: list[dict], log=None, ctx: dict | None = None) -> 
             path = export_items(list(data), title=act.get("title") or "capture",
                                 fmt=act.get("fmt") or "xlsx")
             _log(f"已导出 {len(data)} 条 -> {path.name}")
+            if act.get("webhook") is not False:
+                from .fp_store import push_webhook
+                if push_webhook(list(data)):
+                    _log("已推送 webhook")
+        elif t == "db_save":
+            # 采集入库：source + 记录 + 去重键
+            from .fp_store import save_items
+            src = _interp(act.get("source") or "default", vars)
+            data = vars.get(act.get("data") or "captured") or []
+            if isinstance(data, dict):
+                data = [data]
+            dedup_keys = act.get("dedup_keys")
+            r = save_items(src, list(data), dedup_keys=dedup_keys)
+            _log(f"入库 {src}: 新增 {r['inserted']} / 重复 {r['skipped']}")
+        elif t == "mail_code":
+            # 开第二个 page 读临时邮箱验证码（主流程页不动）。
+            # 流程：boomlify 首页每个地址一行 → 点行内「查看收件箱」进 email-dashboard
+            #       → 再点击含发件人/主题的邮件卡片展开正文 → 读正文 6 位验证码。
+            address = _interp(act.get("address") or "", vars)
+            save = act.get("save") or "code"
+            np = page.context.new_page()
+            try:
+                np.goto("https://boomlify.com/zh/", wait_until="domcontentloaded", timeout=45000)
+                time.sleep(6)
+                # 1) 定位地址行并点「查看收件箱」
+                if address:
+                    try:
+                        addr_el = np.locator(f"text={address}").first
+                        addr_el.wait_for(state="visible", timeout=8000)
+                        for _ in range(6):
+                            addr_el = addr_el.locator("xpath=..")
+                            if addr_el.locator("text=\u67e5\u770b\u6536\u4ef6\u7bb1").count() > 0:
+                                break
+                        # 优先用地址行按钮，其次页面任意「查看收件箱」
+                        try:
+                            addr_el.locator("text=\u67e5\u770b\u6536\u4ef6\u7bb1").first.click(timeout=6000)
+                        except Exception:
+                            np.locator("text=\u67e5\u770b\u6536\u4ef6\u7bb1").first.click(timeout=6000)
+                        time.sleep(5)
+                    except Exception:
+                        pass
+                # 2) 进入收件箱列表后点击微软邮件卡片（发件人 account-security 或主题 Verify your email 或微软验证码正文）
+                clicked_mail = False
+                for sel in [
+                    "text=account-security-noreply@accountprotection.microsoft.com",
+                    "text=Verify your email address",
+                ]:
+                    try:
+                        mail = np.locator(sel).first
+                        if mail.count() > 0 and not clicked_mail:
+                            mail.click(timeout=4000)
+                            clicked_mail = True
+                            time.sleep(3)
+                            break
+                    except Exception:
+                        continue
+                # 3) 读正文验证码
+                txt = np.evaluate("document.body ? document.body.innerText : ''")
+                m = re.findall(r"\b\d{6}\b", txt)
+                code = m[0] if m else ""
+                # 兜底：邮件正文常在 iframe/srcdoc 里，跨帧提取 6 位码
+                if not code:
+                    try:
+                        ifr = np.evaluate("""(() => {
+                          let acc='';
+                          document.querySelectorAll('iframe').forEach(f=>{try{const d=f.contentDocument;if(d)acc+=' '+d.body.innerText;}catch(e){}});
+                          return acc;
+                        })()""")
+                        mi = re.findall(r"\b\d{6}\b", ifr or "")
+                        code = mi[0] if mi else ""
+                    except Exception:
+                        pass
+                vars[save] = code
+                _log(f"邮箱验证码({address}): {code}")
+            finally:
+                np.close()
         elif t == "rotate_ip":
             worker = ctx.get("worker")
             if worker:
                 target = act.get("target")
                 worker._rotate_ip(target)
                 _log("已换 IP" + (f"（{target}）" if target else "（随机）"))
+        elif t == "solve_captcha":
+            # 第三方打码：解 reCAPTCHA/hCaptcha/Turnstile 并注入 token
+            from . import fp_captcha
+            kind = act.get("kind") or "turnstile"
+            sitekey = _interp(act.get("sitekey") or "", vars)
+            url = _interp(act.get("url") or page.url, vars)
+            token = fp_captcha.solve(kind, sitekey, url,
+                                     provider=act.get("provider"),
+                                     api_key=act.get("api_key"))
+            if act.get("save"):
+                vars[act["save"]] = token
+            _log(f"验证码已解码（{kind}），token 长度 {len(token)}")
+            if act.get("inject") is not False:
+                _inject_captcha(page, kind, token)
+        elif t == "check_logged_in":
+            # 登录态探测：selector 命中即判定"仍登录"，否则记 vars/告警
+            sel = _interp(act.get("selector") or "", vars)
+            logged = bool(page.query_selector(sel)) if sel else None
+            if act.get("save"):
+                vars[act["save"]] = logged
+            if logged is False:
+                _log("未检测到登录态（可能需要重新登录）")
+            else:
+                _log("已登录" if logged else "已登录（未配置 selector）")
+            if logged is False and act.get("warn"):
+                worker = ctx.get("worker")
+                if worker:
+                    worker.login_warning = True
         elif t == "screenshot":
             path = act.get("path")
             page.screenshot(path=path or None, full_page=bool(act.get("full")))

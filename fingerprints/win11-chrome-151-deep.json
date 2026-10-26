@@ -1,0 +1,45 @@
+{
+  "name": "win11-chrome-151-deep",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  "platform": "Win32",
+  "ch_platform": "Windows",
+  "platform_version": "15.0.0",
+  "locale": "en-US",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "timezone": "America/New_York",
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "dpr": 1.0
+  },
+  "viewport": {
+    "width": 1920,
+    "height": 955
+  },
+  "cores": 8,
+  "memory": 8,
+  "touch_points": 0,
+  "canvas_noise_seed": "deep-2f91bb",
+  "webgl_vendor": "Google Inc. (NVIDIA)",
+  "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "webgl_max_texture": 16384,
+  "fonts": [
+    "Segoe UI",
+    "Microsoft YaHei",
+    "Arial"
+  ],
+  "canvas_noise": false,
+  "fake_shadow": true,
+  "cdp_cleanup": true,
+  "storage_quota": 5368709120,
+  "color_depth": 24,
+  "network_connection": {
+    "effectiveType": "4g",
+    "rtt": 42,
+    "downlink": 9.6
+  },
+  "desc": "深度伪装全开示例：反噪声哲学 + closed shadow 穿透 + CDP 残留清理 + 存储配额伪装 + 网络类型模拟"
+}

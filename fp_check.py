@@ -83,8 +83,24 @@ def check_fingerprint(fp: dict, env_country: str | None = None) -> dict:
         if key in fp:
             score -= 1   # 声明字段本身不扣（注入逻辑独立验证）
 
+    # 设备一致性（Camoufox coherence 思路）：平台-GPU-核数-屏幕联动
+    try:
+        from .fp_devices import coherence_check
+        co_bad = coherence_check(fp)
+    except Exception:  # noqa: BLE001
+        co_bad = []
+    if co_bad:
+        score -= min(len(co_bad) * 2, 8)
+        for c in co_bad:
+            diffs.append(f"设备一致性: {c}")
+
+    # 噪声策略审计：canvas_noise=false 是哲学选择，只提示不扣分、不影响 pass
+    notes = []
+    if fp.get("canvas_noise") is False:
+        notes.append("噪声策略: canvas_noise=false（原生像素，Camoufox 反噪声哲学）")
+
     return {"score": max(0, min(100, score)), "pass": score >= 90 and not diffs,
-            "diffs": diffs, "actual": r["actual"], "env_country": cc}
+            "diffs": diffs, "notes": notes, "actual": r["actual"], "env_country": cc}
 
 
 def check_template(name: str) -> dict:
@@ -104,6 +120,191 @@ def check_profile(name: str) -> dict:
     cc = get_env_country(name)
     res = check_fingerprint(fp, env_country=cc)
     res["source"] = f"档案 {name}"
+    return res
+
+
+# ==================== 深度镜像模式（fingerprintjs 风格全信号审计） ====================
+
+_DEEP_PROBE_JS = r"""
+async () => {
+  const out = {};
+  const nav = navigator, scr = screen;
+  out.ua = nav.userAgent || '';
+  out.platform = nav.platform || '';
+  out.language = nav.language || '';
+  out.languages = (nav.languages || []).slice(0, 4).join(',');
+  out.cores = nav.hardwareConcurrency;
+  out.memory = nav.deviceMemory;
+  out.touch = nav.maxTouchPoints;
+  out.webdriver = !!nav.webdriver;
+  out.dnt = nav.doNotTrack || nav.msDoNotTrack || '(unset)';
+  out.colorDepth = scr.colorDepth;
+  out.screen = scr.width + 'x' + scr.height;
+  out.dpr = window.devicePixelRatio || 1;
+  out.outer = window.outerWidth + 'x' + window.outerHeight;
+  out.inner = window.innerWidth + 'x' + window.innerHeight;
+  out.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  out.offset = new Date().getTimezoneOffset();
+  out.uad = !!nav.userAgentData;
+  out.uadPlatform = nav.userAgentData ? nav.userAgentData.platform : '(missing)';
+  out.uadBrands = nav.userAgentData
+    ? (nav.userAgentData.brands || []).map(b => b.brand + ':' + b.version).join('|') : '';
+  out.webglVendor = ''; out.webglRenderer = ''; out.webglMaxTex = 0;
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    if (gl) {
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      out.webglVendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      out.webglRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      out.webglMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    }
+  } catch (e) { out.webglVendor = '(err)'; }
+  try {
+    const c = document.createElement('canvas'); c.width = 60; c.height = 30;
+    const ctx = c.getContext('2d');
+    ctx.textBaseline = 'top'; ctx.font = '14px Arial';
+    ctx.fillStyle = '#336699'; ctx.fillRect(0, 0, 60, 30);
+    ctx.fillText('fp-mirror', 8, 4);
+    const a = ctx.getImageData(0, 0, 60, 30).data;
+    const b = ctx.getImageData(0, 0, 60, 30).data;
+    let diff = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
+    out.canvasStable = diff === 0;
+    let dist = 0; for (let i = 0; i < a.length; i += 4) dist += Math.abs(a[i] - 0x33) + Math.abs(a[i + 1] - 0x66) + Math.abs(a[i + 2] - 0x99);
+    out.canvasTouched = dist > 0;
+  } catch (e) { out.canvasStable = false; out.canvasTouched = false; }
+  try {
+    const ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 22050, 44100);
+    const osc = ac.createOscillator(); osc.type = 'triangle'; osc.frequency.value = 12345;
+    osc.connect(ac.destination); osc.start(0);
+    const buf = await ac.startRendering();
+    const ch = buf.getChannelData(0);
+    let sum = 0; for (let i = 0; i < ch.length; i++) sum += Math.abs(ch[i]);
+    out.audioSum = sum;
+    out.audioStable = sum > 0;
+  } catch (e) { out.audioSum = -1; out.audioStable = false; }
+  try { out.fonts = document.fonts ? document.fonts.size : -1; } catch (e) { out.fonts = -1; }
+  try { out.plugins = nav.plugins ? nav.plugins.length : -1; } catch (e) { out.plugins = -1; }
+  out.pdfViewer = nav.pdfViewerEnabled !== undefined ? !!nav.pdfViewerEnabled : false;
+  try {
+    const v = document.createElement('video');
+    out.mediaCodecs = !!v.canPlayType('video/mp4; codecs="avc1.42E01E"');
+  } catch (e) { out.mediaCodecs = false; }
+  try { out.mqPointer = matchMedia('(pointer: fine)').matches ? 'fine' : matchMedia('(pointer: coarse)').matches ? 'coarse' : 'none'; }
+  catch (e) { out.mqPointer = 'n/a'; }
+  try { out.perfNow = performance.now() % 1; out.perfOk = typeof performance.now === 'function'; }
+  catch (e) { out.perfOk = false; }
+  return out;
+}
+"""
+
+# 与模板字段直接对比的信号：键 -> (probe键, 期望函数, 比较函数)
+def _cmp_str(exp, act):
+    return exp is not None and str(act) == str(exp)
+
+
+def _cmp_dpr(exp, act):
+    try:
+        return abs(float(exp) - float(act)) < 0.001
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_DEEP_COMPARE = [
+    ("ua", "ua", lambda f: f.get("ua", ""), _cmp_str),
+    ("platform", "platform", lambda f: f.get("platform", ""), _cmp_str),
+    ("language", "language", lambda f: f.get("locale", ""), _cmp_str),
+    ("languages", "languages", lambda f: ",".join(f.get("languages", [])), _cmp_str),
+    ("cores", "cores", lambda f: str(f.get("cores", "")), _cmp_str),
+    ("memory", "memory", lambda f: str(f.get("memory", "")), _cmp_str),
+    ("touch", "touch", lambda f: str(f.get("touch_points", 0)), _cmp_str),
+    ("screen", "screen", lambda f: f"{f['screen']['width']}x{f['screen']['height']}", _cmp_str),
+    ("dpr", "dpr", lambda f: str(f["screen"].get("dpr", 1)), _cmp_dpr),
+    ("timezone", "timezone", lambda f: f.get("timezone", ""), _cmp_str),
+    ("webglVendor", "webglVendor", lambda f: f.get("webgl_vendor", ""), _cmp_str),
+    ("webglRenderer", "webglRenderer", lambda f: f.get("webgl_renderer", ""), _cmp_str),
+    ("webglMaxTex", "webglMaxTex", lambda f: str(f.get("webgl_max_texture", 16384)), _cmp_str),
+]
+
+# 期望布尔断言（probe 键 -> 描述）
+_DEEP_BOOL = [
+    ("webdriver", False, "webdriver 应为 false"),
+    ("canvasStable", True, "canvas 应确定性稳定（两次采样一致）"),
+    ("audioStable", True, "audio 指纹应可采集"),
+    ("pdfViewer", True, "pdfViewer 应为 true"),
+    ("perfOk", True, "performance.now 应可用"),
+]
+
+
+def deep_fingerprint(fp: dict, env_country: str | None = None) -> dict:
+    """深度镜像审计：启动一次浏览器，采集 fingerprintjs 风格全信号，
+    与模板字段逐项对比，输出「已覆盖 / 未覆盖 / 提示」三类清单。"""
+    from .fp_browser import launch
+
+    p = None
+    try:
+        p, browser, ctx, page = launch(fp, proxy=None, headless=True)
+        page.goto("about:blank")
+        probe = page.evaluate(_DEEP_PROBE_JS)
+    finally:
+        if p:
+            p.stop()
+
+    matched, mismatch = [], []
+    for label, probe_key, expect_fn, cmp in _DEEP_COMPARE:
+        expected = expect_fn(fp)
+        actual = probe.get(probe_key, "")
+        if cmp(expected, actual):
+            matched.append(label)
+        else:
+            mismatch.append({"key": label, "expected": expected, "actual": actual})
+
+    bools_ok, bools_bad = [], []
+    for key, want, note in _DEEP_BOOL:
+        got = probe.get(key)
+        if got == want:
+            bools_ok.append(key)
+        else:
+            bools_bad.append({"key": key, "note": note, "actual": got})
+
+    # 环境人设一致性（语言前缀 vs 国家）
+    env_note = []
+    cc = (env_country or "").upper()
+    if cc and cc in ENV_MAP:
+        lang_ok = _lang_ok_for_country(probe.get("language", ""), cc)
+        if not lang_ok:
+            env_note.append(f"语言 {probe.get('language')} 与国家 {cc} 人设不符")
+
+    covered = len(matched) + len(bools_ok)
+    total = len(_DEEP_COMPARE) + len(_DEEP_BOOL)
+    return {
+        "mode": "deep",
+        "matched": sorted(matched),
+        "bools_ok": sorted(bools_ok),
+        "mismatch": mismatch,
+        "bools_bad": bools_bad,
+        "env_note": env_note,
+        "coverage": f"{covered}/{total}",
+        "score": round(covered / total * 100) if total else 100,
+        "signals": probe,
+        "remark": "JS 注入层审计：TLS 指纹(JA3/JA4)、HTTP 头、服务端时序校验不在本模式覆盖范围",
+    }
+
+
+def deep_check_profile(name: str) -> dict:
+    """对账号档案执行深度镜像审计"""
+    from .fp_profile import get_env_country, load_profile
+
+    prof = load_profile(name)
+    cc = get_env_country(name)
+    res = deep_fingerprint(prof["fp"], env_country=cc)
+    res["source"] = f"档案 {name}"
+    return res
+
+
+def deep_check_template(name: str) -> dict:
+    fp = load(name)
+    res = deep_fingerprint(fp)
+    res["source"] = f"模板 {name}"
     return res
 
 

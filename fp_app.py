@@ -44,11 +44,13 @@ class SessionWorker:
     ops: start / stop / ip / status
     """
 
-    def __init__(self, name: str, pool: list[dict], log: callable, port: int = 8230):
+    def __init__(self, name: str, pool: list[dict], log: callable, port: int = 8230,
+                 headless: bool = False):
         self.name = name
         self._pool = pool
         self.log = log
         self.port = port
+        self.headless = headless
         self._q: _queue.Queue = _queue.Queue()
         self._stop_flag = False
         self.core = Core()
@@ -65,6 +67,9 @@ class SessionWorker:
         self._chall_last = 0.0
         self._recording = False
         self._recorded: list = []
+        self.login_warning = False
+        self._login_cfg: dict | None = None
+        self._login_last = 0.0
         threading.Thread(target=self._loop, daemon=True).start()
 
     def submit(self, op: str, timeout: float = 150, **kw):
@@ -145,6 +150,33 @@ class SessionWorker:
             return
         if found:
             self._auto_solve_challenge()
+        self._check_login_state()
+
+    def _check_login_state(self):
+        """登录态失效探测（档案配置 login_selector/logged_in_selector 时启用）。
+
+        每 5 秒评估一次：login_selector 命中=已退出（需登录，可触发告警）；
+        logged_in_selector 命中=仍在线。仅记录，不打断会话。
+        """
+        cfg = self._login_cfg
+        if not cfg or not (cfg.get("login") or cfg.get("logged")):
+            return
+        now = time.time()
+        if now - self._login_last < 5:
+            return
+        self._login_last = now
+        try:
+            if self.page and self.page.url and not self.page.url.startswith("about:"):
+                if cfg.get("login") and self.page.query_selector(cfg["login"]):
+                    if not self.login_warning:
+                        self.login_warning = True
+                        self.log(f"[{self.name}] 检测到登录页（已退出登录）")
+                if cfg.get("logged") and self.page.query_selector(cfg["logged"]):
+                    if self.login_warning:
+                        self.login_warning = False
+                        self.log(f"[{self.name}] 已恢复登录态")
+        except Exception:
+            pass
 
     def _auto_solve_challenge(self):
         """自动处理 Cloudflare Turnstile 勾选式人机验证。
@@ -221,6 +253,9 @@ class SessionWorker:
         prof = load_profile(self.name)
         self.fp = prof["fp"]
         meta = prof["meta"]
+        self._login_cfg = {"login": meta.get("login_selector"),
+                           "logged": meta.get("logged_in_selector")}
+        self.login_warning = False
         has_storage = load_storage(self.name) is not None
         self.log(f"[{self.name}] 启动：指纹 {self.fp.get('name', '?')}，还原登录态={'是' if has_storage else '无'}")
 
@@ -253,7 +288,8 @@ class SessionWorker:
         # 4) 浏览器：同指纹 + 同登录态
         from .fp_browser import launch
         p, b, ctx, page = launch(self.fp, proxy=self.core.proxy_url,
-                                 headless=False, storage_state=load_storage(self.name))
+                                 headless=self.headless,
+                                 storage_state=load_storage(self.name))
         self.pw, self.browser, self.ctx, self.page = p, b, ctx, page
         # 悬浮窗桥：页面内数据/按钮走 Playwright 桥回 Python（绕过页面 CSP/CORS 对 fetch 的限制）
         ctx.expose_function("__fpBridge", self._bridge)
@@ -599,12 +635,94 @@ class SessionWorker:
             "ip": self.ip,
             "started_at": self.started_at,
             "last_err": self.last_err,
+            "login_warning": self.login_warning,
         }
 
 
 # ============================================================ 控制台管理
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
+
+
+class TaskQueue:
+    """批量任务队列：并发消费 + 自动重试 + 进度统计。
+
+    task = {"op", "names", "params", "retries"}
+    worker 调 manager._run_task(task)（在 SessionManager 中按 op 分发）。
+    """
+
+    def __init__(self, manager, workers: int = 2):
+        self._manager = manager
+        self._q: _queue.Queue = _queue.Queue()
+        self._lock = threading.Lock()
+        self._progress: dict = {"status": "idle", "total": 0, "done": 0,
+                                "succeeded": 0, "failed": 0, "pending": 0,
+                                "current": "", "errors": []}
+        self._workers = workers
+        for _ in range(workers):
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            task = self._q.get()
+            try:
+                self._run(task)
+            except Exception as e:  # noqa: BLE001
+                # 单任务未捕获异常绝不杀死 worker（否则队列停摆、任务永久滞留）
+                try:
+                    getattr(self._manager, "log", lambda *a, **k: None)(
+                        f"[任务] 异常: {task.get('op')} {task.get('names') or []} {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                self._q.task_done()
+
+    def _run(self, task: dict):
+        mgr = self._manager
+        log = getattr(mgr, "log", None) or (lambda *a, **k: None)
+        with self._lock:
+            self._progress["status"] = "running"
+        for name in task.get("names") or []:
+            with self._lock:
+                self._progress["current"] = f"{mgr.__class__.__name__}@{name}"
+            ok = False
+            for attempt in range(int(task.get("retries") or 1) + 1):
+                try:
+                    mgr._run_task(task["op"], name, task.get("params") or {})
+                    ok = True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt >= (int(task.get("retries") or 1)):
+                        with self._lock:
+                            self._progress["errors"].append(f"{name}: {e}")
+                        log(f"[任务] {name} 失败: {e}")
+            with self._lock:
+                self._progress["done"] += 1
+                self._progress["succeeded" if ok else "failed"] += 1
+                self._progress["pending"] = max(0, self._progress["pending"] - 1)
+        with self._lock:
+            if self._progress["pending"] <= 0:
+                self._progress["status"] = "done"
+                self._progress["current"] = ""
+
+    def enqueue(self, op: str, names: list[str] | None = None,
+                params: dict | None = None, retries: int = 0) -> dict:
+        names = names or []
+        with self._lock:
+            # 队列仍在跑时入队：并入当前批次统计，避免重置已完成的进度
+            if self._progress["status"] == "running" and self._progress["pending"] > 0:
+                self._progress["total"] += len(names)
+                self._progress["pending"] += len(names)
+            else:
+                self._progress = {"status": "running", "total": len(names),
+                                  "done": 0, "succeeded": 0, "failed": 0,
+                                  "pending": len(names), "current": "", "errors": []}
+        self._q.put({"op": op, "names": names, "params": params, "retries": retries})
+        return {"op": op, "total": len(names)}
+
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self._progress)
 
 
 class SessionManager:
@@ -621,6 +739,7 @@ class SessionManager:
         self._scan_flag = threading.Event()
         self._scan_flag.set()   # set=空闲（未在扫描）；Event 初始未置位，必须显式置位
         self._scan_progress = ""
+        self.headless = False
         threading.Thread(target=self._auto_loop, daemon=True).start()
         # 定时养号/保活调度（任务执行动作绑定到本管理器）
         self.sched = Scheduler(log=self.log)
@@ -628,6 +747,8 @@ class SessionManager:
         self.detect()
         if reputation_store.summary()["count"] == 0:
             self.start_reputation_scan()   # 首次使用自动扫描一次
+        # 批量任务队列（并发消费，支持重试/进度）
+        self.tasks = TaskQueue(self)
 
     # ---------- 定时任务执行 ----------
     def _sched_runner(self, task: dict):
@@ -733,12 +854,34 @@ class SessionManager:
         threading.Thread(target=_run, daemon=True).start()
         return {"scanning": True, "progress": "0"}
 
+    def check_health(self, log=print) -> dict:
+        """节点自愈：健康检查全池，标记失活节点，返回 {alive, dead, dead_names}。
+
+        失活节点从 preferred_names / 同国路由候选中被剔除，避免被选到；
+        同步记录到信誉库存。
+        """
+        from .fp_reputation import health_check as _hc
+        pool = list(self.nodes) or find_local_nodes()
+        if not pool:
+            return {"alive": 0, "dead": 0, "dead_names": []}
+        res = _hc(pool, log=self.log)
+        for name in res["dead"]:
+            reputation_store.set_alive(name, False)
+        for name in res["alive"]:
+            reputation_store.set_alive(name, True)
+        self.log(f"[健康] 检查完成：存活 {len(res['alive'])} / 失活 {len(res['dead'])}"
+                 + (f"（{', '.join(res['dead'][:5])}）" if res["dead"] else ""))
+        return {"alive": len(res["alive"]), "dead": len(res["dead"]),
+                "dead_names": res["dead"]}
+
     def node_list(self) -> list[dict]:
-        """节点明细（信誉+延迟，按信誉降序/延迟升序）——控制台/悬浮窗选择用"""
+        """节点明细（信誉+延迟，存活优先，按信誉降序/延迟升序）——控制台/悬浮窗选择用"""
         with self._lock:
             pool = [n["name"] for n in self.nodes]
         out = []
         for n in pool:
+            if not reputation_store.is_alive(n):
+                continue   # 自愈：失活节点不再展示/可选
             r = reputation_store.get(n) or {}
             out.append({"name": n, "score": r.get("score", -1),
                         "lat": r.get("latency_ms")})
@@ -750,7 +893,7 @@ class SessionManager:
         with self._lock:
             w = self.workers.get(name)
         if not w:
-            w = SessionWorker(name, self.nodes, self.log, self.port)
+            w = SessionWorker(name, self.nodes, self.log, self.port, self.headless)
             with self._lock:
                 self.workers[name] = w
         w.submit("start")
@@ -861,6 +1004,32 @@ class SessionManager:
             raise RuntimeError(f"会话不存在: {name}")
         return w.submit("rec_stop", timeout=60)
 
+    def _run_task(self, op: str, name: str, params: dict):
+        """TaskQueue 单账号任务分发（start/stop/ip/fingerprint/automation）。"""
+        if op == "start":
+            self.start_session(name)
+        elif op == "stop":
+            self.stop_session(name)
+        elif op == "ip":
+            self.rotate_ip(name, params.get("node"))
+        elif op == "fingerprint":
+            self.rotate_fingerprint(name)
+        elif op == "automation":
+            self.run_automation(name, params.get("script"), params.get("variables") or {},
+                                bool(params.get("humanize")))
+        else:
+            raise RuntimeError(f"未知任务操作: {op}")
+
+    def task_enqueue(self, op: str, names: list | None = None,
+                     params: dict | None = None, retries: int = 0) -> dict:
+        """入队批量任务（异步执行，含重试与进度）。"""
+        with self._lock:
+            targets = names or list(self.workers.keys())
+        return self.tasks.enqueue(op, targets, params, retries)
+
+    def task_status(self) -> dict:
+        return self.tasks.status()
+
     def batch_op(self, op: str, names: list | None = None) -> dict:
         """批量操作：start/stop/ip/fingerprint，names 空=全部在线账号"""
         with self._lock:
@@ -922,6 +1091,31 @@ class SessionManager:
                 out.append({"source": f"模板 {t}", "score": 0, "diffs": [str(e)]})
         return {"items": out}
 
+    def check_deep(self, profile: str | None = None) -> dict:
+        """深度镜像审计（fingerprintjs 风格全信号覆盖）"""
+        from .fp_check import deep_check_profile, deep_check_template
+        from .fp_browser import list_templates
+        if profile:
+            if profile in [p["name"] for p in list_profiles()]:
+                return deep_check_profile(profile)
+            if profile in list_templates():
+                return deep_check_template(profile)
+            raise RuntimeError(f"既不是档案也不是模板: {profile}")
+        items = []
+        for p in list_profiles()[:3]:
+            try:
+                items.append(deep_check_profile(p["name"]))
+            except Exception as e:  # noqa: BLE001
+                items.append({"source": f"档案 {p['name']}", "coverage": "err",
+                              "mismatch": [{"key": "error", "actual": str(e)}]})
+        for t in list_templates()[:2]:
+            try:
+                items.append(deep_check_template(t))
+            except Exception as e:  # noqa: BLE001
+                items.append({"source": f"模板 {t}", "coverage": "err",
+                              "mismatch": [{"key": "error", "actual": str(e)}]})
+        return {"items": items}
+
     def _auto_loop(self):
         last = None
         while True:
@@ -949,8 +1143,32 @@ class SessionManager:
 
 # ============================================================ HTTP 服务
 
-def make_handler(manager: SessionManager):
+def make_handler(manager: SessionManager, token: str | None = None,
+                 allow_hosts: list[str] | None = None):
+    allow_hosts = allow_hosts or ["127.0.0.1", "::1", "localhost"]
+
     class Handler(BaseHTTPRequestHandler):
+        def _check_auth(self) -> bool:
+            """token 鉴权 + 来源 IP 白名单。
+
+            兼容三处凭据：Authorization: Bearer / X-Auth-Token 头 / ?token= 查询参数
+            （SSE 的 EventSource 无法自定义头部，只能走查询参数）。
+            """
+            if self.client_address[0] not in allow_hosts:
+                return False
+            if not token:
+                return True
+            import urllib.parse as _up
+            q = _up.parse_qs(_up.urlparse(self.path).query)
+            if q.get("token") and q["token"][0] == token:
+                return True
+            auth = self.headers.get("Authorization", "")
+            xtok = self.headers.get("X-Auth-Token", "")
+            return auth == f"Bearer {token}" or xtok == token
+
+        def _deny(self):
+            self._send(401, "text/plain; charset=utf-8", b"unauthorized")
+
         def _send(self, code: int, content_type: str, body: bytes):
             self.send_response(code)
             self.send_header("Content-Type", content_type)
@@ -970,8 +1188,14 @@ def make_handler(manager: SessionManager):
             self._send(204, "text/plain; charset=utf-8", b"")
 
         def do_GET(self):
+            # 控制台页面无需鉴权；所有 /api/*（含 SSE）需要
+            if self.path.startswith("/api/") and not self._check_auth():
+                self._deny()
+                return
             if self.path == "/" or self.path == "/index.html":
-                self._send(200, "text/html; charset=utf-8", FRONTEND.encode("utf-8"))
+                page_html = FRONTEND.replace("__AUTH_TOKEN__",
+                                             json.dumps(token or "", ensure_ascii=False))
+                self._send(200, "text/html; charset=utf-8", page_html.encode("utf-8"))
             elif self.path == "/api/status":
                 self._json(manager.status())
             elif self.path == "/api/nodes":
@@ -980,10 +1204,34 @@ def make_handler(manager: SessionManager):
                 self._json(manager.automation_list())
             elif self.path == "/api/sched/list":
                 self._json(manager.sched_list())
+            elif self.path.startswith("/api/events"):
+                self._sse(manager.status)
             else:
                 self._send(404, "text/plain; charset=utf-8", b"not found")
 
+        def _sse(self, status_fn):
+            """SSE 实时推送：每 2 秒推一次全量状态（前端 EventSource 消费）。
+
+            页面打开即建立长连接；断线由前端 EventSource 自动重连。
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                while True:
+                    line = json.dumps(status_fn(), ensure_ascii=False)
+                    self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    time.sleep(2)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
         def do_POST(self):
+            if not self._check_auth():
+                self._deny()
+                return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
@@ -1074,6 +1322,69 @@ def make_handler(manager: SessionManager):
                     self._json(manager.sched_delete(body.get("name")))
                 elif self.path == "/api/check":
                     self._json(manager.check_fingerprint(body.get("profile")))
+                elif self.path == "/api/check/deep":
+                    self._json(manager.check_deep(body.get("profile")))
+                # ---- 新增：档案字段 ----
+                elif self.path == "/api/profile/update":
+                    from .fp_profile import update_profile
+                    self._json(update_profile(body.get("name"), email=body.get("email"),
+                                              username=body.get("username"),
+                                              password=body.get("password"),
+                                              tags=body.get("tags"),
+                                              notes=body.get("notes"),
+                                              login_selector=body.get("login_selector"),
+                                              logged_in_selector=body.get("logged_in_selector"),
+                                              set_bound_node=body.get("node")))
+                elif self.path == "/api/profile/get":
+                    from .fp_profile import profile_full
+                    self._json(profile_full(body.get("name")))
+                # ---- 新增：采集库 ----
+                elif self.path == "/api/store/stats":
+                    from .fp_store import stats
+                    self._json(stats())
+                elif self.path == "/api/store/query":
+                    from .fp_store import query
+                    self._json({"items": query(body.get("source"),
+                                               int(body.get("limit") or 50),
+                                               int(body.get("offset") or 0))})
+                elif self.path == "/api/store/clear":
+                    from .fp_store import clear
+                    clear(body.get("source"))
+                    self._json({"ok": True})
+                elif self.path == "/api/store/webhook":
+                    from .fp_store import set_webhook, webhook_config
+                    self._json(set_webhook(body.get("url")) or webhook_config())
+                # ---- 新增：打码配置 ----
+                elif self.path == "/api/captcha/config":
+                    from . import fp_captcha
+                    self._json(fp_captcha.configure(provider=body.get("provider"),
+                                                    api_key=body.get("api_key"),
+                                                    timeout=body.get("timeout")))
+                elif self.path == "/api/captcha/status":
+                    from . import fp_captcha
+                    self._json(fp_captcha.status())
+                # ---- 新增：节点健康 / 任务队列 / 登录检测 ----
+                elif self.path == "/api/health":
+                    self._json(manager.check_health())
+                elif self.path == "/api/task/enqueue":
+                    op = body.get("op")
+                    if op not in ("start", "stop", "ip", "fingerprint", "automation"):
+                        raise RuntimeError("op 仅支持 start/stop/ip/fingerprint/automation")
+                    self._json(manager.task_enqueue(op, body.get("names"),
+                                                    params={"node": body.get("node"),
+                                                            "script": body.get("script"),
+                                                            "humanize": body.get("humanize")},
+                                                    retries=int(body.get("retries") or 0)))
+                elif self.path == "/api/task/status":
+                    self._json(manager.task_status())
+                elif self.path == "/api/session/check_login":
+                    with manager._lock:
+                        w = manager.workers.get(body.get("name"))
+                    if not w:
+                        raise RuntimeError(f"会话不存在: {body.get('name')}")
+                    self._json({"login_warning": w.login_warning,
+                                "config": w._login_cfg or {},
+                                "status": w.status()})
                 else:
                     self._send(404, "text/plain; charset=utf-8", b"not found")
             except Exception as e:  # noqa: BLE001
@@ -1327,7 +1638,12 @@ FRONTEND = """<!DOCTYPE html>
       <input class="num" type="number" id="newCount" value="1" min="1" max="10" title="批量数量">
       <button class="btn primary" onclick="createAccount()">创建并启动</button>
     </div>
-    <div class="hint">批量时自动编号（shop01-1、shop01-2…），最多 10 个</div>
+    <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
+      <input class="input" id="newEmail" placeholder="邮箱（可选）" style="flex:1">
+      <input class="input" id="newUsername" placeholder="用户名（可选）" style="flex:1">
+      <input class="input" id="newPassword" type="password" placeholder="密码（加密存储）" style="flex:1">
+    </div>
+    <div class="hint">批量时自动编号（shop01-1、shop01-2…），最多 10 个；密码经本机密钥加密落盘</div>
   </div>
 
     <div class="card">
@@ -1339,6 +1655,7 @@ FRONTEND = """<!DOCTYPE html>
     <div class="controls">
       <button class="btn" onclick="doApi('detect')">重新探测节点</button>
       <button class="btn" onclick="doApi('reputation/scan')">扫描节点信誉</button>
+      <button class="btn" onclick="runHealth()">节点健康检查</button>
     </div>
     <h2 style="margin-top:12px">批量操作</h2>
     <div class="controls">
@@ -1399,8 +1716,54 @@ FRONTEND = """<!DOCTYPE html>
     <div class="row"><span class="k">说明</span><span class="v">注入一致性 + 环境人设匹配评分（0-100）</span></div>
     <div class="controls">
       <button class="btn primary" onclick="runCheck()">跑全量自检</button>
+      <button class="btn" onclick="runDeep()">深度镜像审计</button>
     </div>
     <div id="checkOut"></div>
+  </div>
+
+  <div class="card">
+    <h2>采集库</h2>
+    <div class="row"><span class="k">记录</span><span class="v" id="storeTotal">-</span></div>
+    <div class="row"><span class="k">按来源</span><span class="v" id="storeBySrc">-</span></div>
+    <div class="controls">
+      <button class="btn primary" onclick="queryStore()">查询最近记录</button>
+      <button class="btn" onclick="clearStore()">清空</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+      <input class="input" id="whUrl" placeholder="Webhook URL（可选）" style="flex:1">
+      <button class="btn" onclick="saveWebhook()">保存</button>
+    </div>
+    <div class="hint">脚本动作 db_save 按 (来源+去重键) 去重入库；export 可推送 webhook</div>
+    <div id="storeOut" class="hint" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <h2>打码配置</h2>
+    <div class="row"><span class="k">服务商</span><span class="v" id="capProv">-</span></div>
+    <div class="row"><span class="k">密钥</span><span class="v" id="capKey">-</span></div>
+    <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+      <select class="input" id="capProvider" style="width:110px">
+        <option value="2captcha">2captcha</option>
+        <option value="capsolver">capsolver</option>
+      </select>
+      <input class="input" id="capApiKey" placeholder="API Key" style="flex:1">
+      <button class="btn primary" onclick="saveCaptcha()">保存</button>
+    </div>
+    <div class="hint">解 reCAPTCHA/hCaptcha/Turnstile；脚本动作 solve_captcha 使用</div>
+  </div>
+
+  <div class="card">
+    <h2>批量任务队列</h2>
+    <div class="row"><span class="k">状态</span><span class="v" id="tkStatus">-</span></div>
+    <div class="row"><span class="k">进度</span><span class="v" id="tkProgress">-</span></div>
+    <div class="controls">
+      <button class="btn" onclick="enqueueTask('start')">入队启动</button>
+      <button class="btn" onclick="enqueueTask('stop')">入队停止</button>
+      <button class="btn" onclick="enqueueTask('ip')">入队换 IP</button>
+      <button class="btn" onclick="refreshTask()">刷新</button>
+    </div>
+    <div class="hint">异步批量到全部在线账号，支持重试；任务队列独立于上方「批量操作」</div>
+    <div id="tkOut" class="hint" style="margin-top:6px"></div>
   </div>
 </div>
 
@@ -1413,7 +1776,28 @@ FRONTEND = """<!DOCTYPE html>
 
 <div class="toast" id="toast"></div>
 
+<!-- 账号资料编辑弹窗 -->
+<div id="editModal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:100;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:12px;padding:18px 20px;width:340px;box-shadow:0 12px 40px rgba(0,0,0,.25)">
+    <h2 style="font-size:15px;margin-bottom:12px">账号资料 · <span id="emName"></span></h2>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <input class="input" id="emEmail" placeholder="邮箱" style="width:100%">
+      <input class="input" id="emUsername" placeholder="用户名" style="width:100%">
+      <input class="input" id="emPassword" type="password" placeholder="密码（空白=不修改）" style="width:100%">
+      <input class="input" id="emTags" placeholder="标签（逗号分隔）" style="width:100%">
+      <input class="input" id="emLoginSel" placeholder="登录失效选择器（可选）" style="width:100%">
+      <textarea class="input" id="emNotes" rows="2" placeholder="备注" style="width:100%;font-size:12px;resize:vertical"></textarea>
+    </div>
+    <div class="controls" style="margin-top:12px">
+      <button class="btn primary" onclick="saveEdit()">保存</button>
+      <button class="btn" onclick="closeEdit()">取消</button>
+    </div>
+  </div>
+</div>
+
 <script>
+window.FP_TOKEN = __AUTH_TOKEN__;
+const AUTH_HEADERS = window.FP_TOKEN ? { 'X-Auth-Token': window.FP_TOKEN } : {};
 let state = null;
 let nodeList = [];   /* 节点明细缓存（选节点下拉用） */
 let scripts = [];    /* 自动化脚本列表 */
@@ -1422,7 +1806,8 @@ let recording = {};  /* 录制状态（会话名 -> bool） */
 function toast(m) { const t = document.getElementById('toast'); t.textContent = m; t.style.display = 'block';
   clearTimeout(t._tm); t._tm = setTimeout(() => t.style.display = 'none', 2200); }
 async function api(path, body) {
-  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) };
+  const opts = body === undefined ? { headers: AUTH_HEADERS }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS }, body: JSON.stringify(body || {}) };
   const r = await fetch(path, opts); const j = await r.json();
   if (j.error) throw new Error(j.error); return j;
 }
@@ -1434,6 +1819,19 @@ async function refresh() {
   } catch (e) {}
 }
 function esc(s) { return String(s ?? '').replace(/</g, '&lt;'); }
+
+/* SSE 实时推送：优先 EventSource（免 3s 轮询），失败回退轮询 */
+(function () {
+  try {
+    const es = new EventSource('/api/events' + (window.FP_TOKEN ? '?token=' + encodeURIComponent(window.FP_TOKEN) : ''));
+    es.onmessage = function (ev) {
+      try { state = JSON.parse(ev.data); if (!nodeList.length) refresh(); else render(); } catch (e) {}
+    };
+    es.onerror = function () { if (es.readyState === EventSource.CLOSED) es.close(); };
+  } catch (e) {}
+})();
+async function refreshSlow() { await refresh(); }
+
 
 function render() {
   document.getElementById('bProxy').className = 'badge ' + (state.nodes > 0 ? 'on' : 'off');
@@ -1467,8 +1865,11 @@ function render() {
         +         '<div class="row"><span class="k">绑定节点</span><span class="v">' + esc((s.node || p.node || '-') + (s.node_score != null && s.node_score >= 0 ? ' ★' + s.node_score : '')) + '</span></div>'
         + '<div class="row"><span class="k">出口 IP</span><span class="v">' + esc(s.ip || '-') + '</span></div>'
         + '<div class="row"><span class="k">登录态</span><span class="v">' + (p.has_storage ? '已保存' : '无') + '</span></div>'
+        + (s.login_warning ? '<div class="row"><span class="k" style="color:#dc2626">登录态</span><span class="v" style="color:#dc2626">疑似已退出！</span></div>' : '')
+        + '<div class="row"><span class="k">账号</span><span class="v">' + esc((p.email || p.username) || '-') + '</span></div>'
         + '<div class="row"><span class="k">创建时间</span><span class="v">' + esc(p.created_at || '-') + '</span></div>'
         + '<div class="controls">'
+        + '<button class="btn small" onclick="openEdit(\'' + esc(p.name) + '\')">资料</button>'
         + (run ? ''
             : '<button class="btn small primary" onclick="act(\'start\',\'' + esc(p.name) + '\')">启动</button>')
         + (run ? '<button class="btn small" onclick="act(\'stop\',\'' + esc(p.name) + '\')">停止</button>'
@@ -1704,11 +2105,146 @@ async function runCheck() {
     el.innerHTML = '<div class="hint">自检失败: ' + esc(e.message) + '</div>';
   }
 }
+async function runDeep() {
+  const el = document.getElementById('checkOut');
+  if (!el) return;
+  el.innerHTML = '<div class="hint">深度镜像审计中（采集 fingerprintjs 风格全信号）...</div>';
+  try {
+    const r = await api('/api/check/deep', {});
+    const items = r.items || [];
+    el.innerHTML = items.map(it => {
+      const mm = (it.mismatch || []).map(m => '· ' + esc(m.key) + ': 期望 ' + esc(String(m.expected).slice(0, 40)) + ' 实际 ' + esc(String(m.actual).slice(0, 40))).join('');
+      return '<div class="row"><span class="k">' + esc(it.source) + '</span>'
+        + '<span style="color:' + (it.score >= 90 ? '#16a34a' : '#d97706') + '"><b>' + esc(it.coverage) + '</b>（' + it.score + '）</span></div>'
+        + (missed ? '<div class="hint" style="margin:1px 0 1px 12px;color:#dc2626">' + missed + '</div>' : '')
+        + (it.env_note || []).map(n => '<div class="hint" style="margin:1px 0 1px 12px;color:#d97706">' + esc(n) + '</div>').join('');
+    }).join('') || '<div class="empty">无结果</div>';
+  } catch (e) {
+    el.innerHTML = '<div class="hint">深度审计失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+/* ==================== 账号资料编辑 ==================== */
+let editName = null;
+async function openEdit(name) {
+  editName = name;
+  document.getElementById('emName').textContent = name;
+  document.getElementById('emEmail').value = '';
+  document.getElementById('emUsername').value = '';
+  document.getElementById('emPassword').value = '';
+  document.getElementById('emTags').value = '';
+  document.getElementById('emNotes').value = '';
+  document.getElementById('emLoginSel').value = '';
+  try {
+    const g = await api('/api/profile/get', { name });
+    const m = g.meta || {};
+    document.getElementById('emEmail').value = m.email || '';
+    document.getElementById('emUsername').value = m.username || '';
+    document.getElementById('emTags').value = (m.tags || []).join(',');
+    document.getElementById('emNotes').value = m.notes || '';
+    document.getElementById('emLoginSel').value = m.login_selector || '';
+  } catch (e) {}
+  const m = document.getElementById('editModal');
+  m.style.display = 'flex';
+}
+function closeEdit() { document.getElementById('editModal').style.display = 'none'; }
+async function saveEdit() {
+  try {
+    await api('/api/profile/update', {
+      name: editName,
+      email: document.getElementById('emEmail').value.trim() || undefined,
+      username: document.getElementById('emUsername').value.trim() || undefined,
+      password: document.getElementById('emPassword').value || undefined,
+      tags: (document.getElementById('emTags').value || '').split(',').map(s => s.trim()).filter(Boolean),
+      notes: document.getElementById('emNotes').value || undefined,
+      login_selector: document.getElementById('emLoginSel').value.trim() || undefined,
+    });
+    toast('已保存资料');
+    closeEdit(); await refresh();
+  } catch (e) { toast('失败: ' + e.message); }
+}
+
+/* ==================== 节点健康检查 ==================== */
+async function runHealth() {
+  toast('正在健康检查节点（可能较慢）...');
+  try { const r = await api('/api/health', {}); toast('健康检查完成: 存活 ' + r.alive + ' / 失活 ' + r.dead); }
+  catch (e) { toast('失败: ' + e.message); }
+  await refresh();
+}
+
+/* ==================== 采集库 ==================== */
+let storeItems = [];
+async function refreshStore() {
+  try {
+    const st = await api('/api/store/stats', {});
+    document.getElementById('storeTotal').textContent = st.total + ' 条';
+    const src = st.by_source || {};
+    document.getElementById('storeBySrc').textContent = Object.keys(src).length
+      ? Object.entries(src).map(([k, v]) => k + ':' + v).join(' · ') : '无';
+  } catch (e) {}
+}
+async function queryStore() {
+  try {
+    const r = await api('/api/store/query', { limit: 20 });
+    storeItems = r.items || [];
+    document.getElementById('storeOut').textContent = storeItems.length
+      ? storeItems.map(i => '[' + i.source + '] ' + JSON.stringify(i.record).slice(0, 60) + ' @' + i.created_at).join('\n')
+      : '暂无记录（脚本 db_save 后出现）';
+  } catch (e) { document.getElementById('storeOut').textContent = '查询失败: ' + e.message; }
+}
+async function clearStore() {
+  if (!confirm('确认清空采集库？')) return;
+  try { await api('/api/store/clear', {}); toast('已清空'); await refreshStore(); }
+  catch (e) { toast('失败: ' + e.message); }
+}
+async function saveWebhook() {
+  const url = document.getElementById('whUrl').value.trim();
+  try { await api('/api/store/webhook', { url: url || undefined }); toast('Webhook 已保存'); }
+  catch (e) { toast('失败: ' + e.message); }
+}
+
+/* ==================== 打码配置 ==================== */
+async function refreshCaptcha() {
+  try {
+    const c = await api('/api/captcha/status', {});
+    document.getElementById('capProv').textContent = c.provider || '-';
+    document.getElementById('capKey').textContent = c.configured ? '已配置' : '未配置';
+  } catch (e) {}
+}
+async function saveCaptcha() {
+  const provider = document.getElementById('capProvider').value;
+  const apiKey = document.getElementById('capApiKey').value.trim();
+  try { await api('/api/captcha/config', { provider, api_key: apiKey }); toast('打码配置已保存'); await refreshCaptcha(); }
+  catch (e) { toast('失败: ' + e.message); }
+}
+
+/* ==================== 批量任务队列 ==================== */
+let taskTimer = null;
+async function refreshTask() {
+  try {
+    const t = await api('/api/task/status', {});
+    document.getElementById('tkStatus').textContent = t.status;
+    document.getElementById('tkProgress').textContent = (t.status === 'idle' || t.status === 'done')
+      ? '完成 ' + t.succeeded + ' / 失败 ' + t.failed
+      : (t.done + '/' + t.total + ' 成功' + t.succeeded + ' 失败' + t.failed + (t.current ? ' 当前:' + t.current : ''));
+    document.getElementById('tkOut').textContent = (t.errors || []).slice(0, 5).join('; ');
+    if (t.status === 'done' || t.status === 'idle') { if (taskTimer) { clearInterval(taskTimer); taskTimer = null; } }
+    else if (!taskTimer) { taskTimer = setInterval(refreshTask, 2000); }
+  } catch (e) {}
+}
+async function enqueueTask(op) {
+  try { const r = await api('/api/task/enqueue', { op, retries: 1 }); toast(op + ' 已入队: ' + r.total + ' 个'); await refreshTask(); }
+  catch (e) { toast('失败: ' + e.message); }
+}
 
 refresh();
 refreshScripts();
 refreshSched();
-setInterval(refresh, 3000);
+refreshStore();
+refreshTask();
+refreshCaptcha();
+/* SSE 断线兜底：30s 全量轮询（正常走事件推送，几乎不触发） */
+setInterval(refresh, 30000);
 </script>
 </body>
 </html>
@@ -1716,27 +2252,156 @@ setInterval(refresh, 3000);
 
 
 def main():
+    import sys as _sys
+    # CLI 模式：在 argparse 之前拦截，`--cli` 之后的全部 token 直接交 run_cli，
+    # 避免 CLI 子命令的 `--humanize/--count` 等标志与 argparse 冲突。
+    if "--cli" in _sys.argv:
+        _argv = _sys.argv[1:]
+        run_cli(_argv[_argv.index("--cli") + 1:])
+        return
     parser = argparse.ArgumentParser(description="可换指纹浏览器多账号控制台")
     parser.add_argument("--port", type=int, default=8230)
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--token", default=None, help="控制台 API token（非空则开启鉴权）")
+    parser.add_argument("--allow-hosts", default="127.0.0.1,::1,localhost",
+                        help="允许访问控制台的来源 IP（逗号分隔）")
     args = parser.parse_args()
 
     manager = SessionManager()
     manager.port = args.port
+    token = args.token or None
+    allow_hosts = [h.strip() for h in args.allow_hosts.split(",") if h.strip()]
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(manager))
+        server = ThreadingHTTPServer(("127.0.0.1", args.port),
+                                     make_handler(manager, token=token, allow_hosts=allow_hosts))
     except OSError as e:
         print(f"[错误] 端口 {args.port} 被占用（{e}）。请换端口启动：")
         print(f"       python -m fingerprint_browser.fp_app --port {args.port + 1}")
         return
     url = f"http://127.0.0.1:{args.port}"
-    print(f"控制台已启动: {url}  （Ctrl+C 退出）")
+    print(f"控制台已启动: {url}  （Ctrl+C 退出）"
+          + ("  [token 鉴权已开启]" if token else ""))
     if not args.no_open:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("正在退出...")
+    finally:
+        for w in list(manager.workers.values()):
+            try:
+                w.shutdown()
+            except Exception:
+                pass
+
+
+def run_cli(argv: list[str]):
+    """无 GUI 的命令行用法（cron / 脚本友好）：
+
+        python -m fingerprint_browser.fp_app --cli status
+        python -m fingerprint_browser.fp_app --cli create shop01
+        python -m fingerprint_browser.fp_app --cli list-nodes
+        python -m fingerprint_browser.fp_app --cli bind shop01 US-住宅-01
+        python -m fingerprint_browser.fp_app --cli start ms_reg_01
+        python -m fingerprint_browser.fp_app --cli ip ms_reg_01 US-住宅-01
+        python -m fingerprint_browser.fp_app --cli run shop01 养号-每日活跃 --humanize
+        python -m fingerprint_browser.fp_app --cli health
+        python -m fingerprint_browser.fp_app --cli captcha-config 2captcha KEY
+    """
+    import sys as _sys
+    cmd = argv[0] if argv else "status"
+    rest = argv[1:]
+
+    def _unpack(rest, *flags):
+        out = {}
+        for f in flags:
+            if f in rest:
+                out[f] = rest[rest.index(f) + 1]
+        return out
+
+    manager = SessionManager()
+    manager.headless = True   # CLI 一律 headless
+    try:
+        if cmd == "status":
+            st = manager.status()
+            print(f"节点池 {st['nodes']} | 档案 {len(st['profiles'])}"
+                  f" | 在线 {sum(1 for s in st['sessions'] if s['running'])}")
+            for s in st["sessions"]:
+                print(f"  {s['name']}: {'在线' if s['running'] else '停止'}"
+                      f" 节点={s.get('node')} IP={s.get('ip')} 指纹={s.get('fp')}")
+        elif cmd == "create":
+            name = rest[0] if rest else ""
+            if not name:
+                print("用法: create NAME")
+                return 2
+            cnt = int(_unpack(rest, "--count").get("--count", "1"))
+            created = manager.create_account(name, cnt)
+            for it in created:
+                manager.start_session(it["name"])
+            print(f"已创建并启动 {len(created)} 个: {', '.join(c['name'] for c in created)}")
+        elif cmd == "list-nodes":
+            for n in manager.node_list():
+                print(f"  {n['name']}: 评分 {n['score']} 延迟 {n['lat']}ms")
+        elif cmd == "bind":
+            # 固定账号出口节点：写回档案绑定，下次 start 即走该节点
+            name = rest[0] if rest else ""
+            node = rest[1] if len(rest) > 1 else ""
+            if not name or not node:
+                print("用法: bind NAME NODE")
+                return 2
+            if node not in [n["name"] for n in manager.node_list()]:
+                print(f"节点不存在: {node}（用 list-nodes 查看）")
+                return 2
+            set_bound_node(name, node)
+            print(f"已绑定 {name} -> {node}")
+        elif cmd == "ip":
+            # 启动并换到指定节点（缺省随机）；目标网站看到的即该节点出口 IP
+            name = rest[0] if rest else ""
+            node = rest[1] if len(rest) > 1 else None
+            if not name:
+                print("用法: ip NAME [NODE]")
+                return 2
+            manager.start_session(name)
+            r = manager.rotate_ip(name, node)
+            print(f"{name} 换 IP: 节点={r.get('node')} IP={r.get('ip')}")
+        elif cmd == "start":
+            name = rest[0] if rest else ""
+            st = manager.start_session(name)
+            print(f"启动 {name}: {'成功' if st['running'] else '失败'} IP={st.get('ip')}")
+        elif cmd == "stop":
+            name = rest[0] if rest else ""
+            manager.stop_session(name)
+            print(f"已停止 {name}")
+        elif cmd == "run":
+            name = rest[0] if rest else ""
+            script = rest[1] if len(rest) > 1 else ""
+            if not name or not script:
+                print("用法: run NAME SCRIPT [--humanize]")
+                return 2
+            humanize = "--humanize" in rest
+            if name not in [p["name"] for p in manager.status()["profiles"]]:
+                print(f"档案不存在，先创建: {name}")
+                manager.create_account(name)
+            manager.start_session(name)
+            r = manager.run_automation(name, script, {}, humanize)
+            print(f"脚本 {script} 完成: 成功 {r['ok']} 失败 {r['fail']}"
+                  f" ({(r.get('ended') or '')})")
+            manager.stop_session(name)
+        elif cmd == "health":
+            print(manager.check_health())
+        elif cmd == "captcha-config":
+            if len(rest) >= 2:
+                from . import fp_captcha
+                fp_captcha.configure(provider=rest[0], api_key=rest[1])
+            from . import fp_captcha
+            print("打码配置:", fp_captcha.status())
+        else:
+            print(f"未知命令: {cmd}\n支持: status create list-nodes bind ip start stop run health captcha-config")
+            return 2
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"[CLI] 错误: {e}")
+        return 1
     finally:
         for w in list(manager.workers.values()):
             try:

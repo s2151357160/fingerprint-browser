@@ -6,6 +6,24 @@ __pycache__/
 logs/
 schedules.json
 
+# 敏感配置与数据（节点凭据/加密密钥/采集库/账号档案）
+config/
+*.key
+*.db
+exports/
+profiles/
+node_reputation.json
+sub_nodes_cache.yaml
+subscriptions.txt
+custom_proxies.json
+fingerprints_cache.json
+
+# 敏感/一次性调试脚本（含真实邮箱、注册会话等运营痕迹，勿入库）
+scripts/ms-*
+scripts/dbg-*
+scripts/slow_drive.py
+scripts/get-temp-mail.json
+
 # 外部内核二进制（58MB，单独下载，不入库）
 core/
 

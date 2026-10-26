@@ -2,5 +2,11 @@
 # 安装：pip install -r requirements.txt
 # 首次使用还需下载浏览器内核：python -m playwright install chromium
 
+# 必需
 playwright>=1.62
 pyyaml>=6.0
+
+# 可选（缺失时对应功能自动降级，不影响启动）
+curl_cffi>=0.7     # HTTP 层 Chrome TLS 指纹（订阅拉取/打码请求更稳）
+openpyxl>=3.1      # 采集导出 xlsx（缺失回退 csv）
+cryptography>=42   # 档案敏感字段本地加密（缺失回退 base64 标记）

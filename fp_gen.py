@@ -18,6 +18,10 @@ from __future__ import annotations
 import random
 import secrets
 
+# 设备分布模式（借鉴 Camoufox fpgen：按真实世界分布抽样设备特征）
+# 置 False 即回退旧的"手写组合随机"逻辑
+FP_USE_DISTRIBUTION = True
+
 # 兜底内核版本（launch 时以实际 Chromium 版本自动校正）
 CHROME_VER = "151"
 
@@ -82,14 +86,20 @@ def detect_host_screen() -> tuple[int, int, float] | None:
         return None
 
 
-def random_fingerprint(allow_mac: bool = False) -> dict:
+def random_fingerprint(allow_mac: bool = False, use_distribution: bool | None = None) -> dict:
     """生成一套全新的随机自洽指纹。
 
-    allow_mac: 是否允许生成 macOS 指纹。默认 False（宿主一致性优先：
-    Windows 宿主生成 Windows 指纹，字体/CPU 指纹天然自洽）。
-    屏幕尺寸默认适配宿主显示器实际分辨率（窗口与屏幕一致，避免视口超屏）；
-    宿主检测失败时回退常见分辨率池。
+    allow_mac: 是否允许生成 macOS 指纹。默认 False（宿主一致性优先）。
+    use_distribution: 设备分布模式（True=按真实世界设备分布抽样，更接近真实流量；
+        缺省跟随模块开关 FP_USE_DISTRIBUTION）。
     """
+    if use_distribution is None:
+        use_distribution = FP_USE_DISTRIBUTION
+
+    if use_distribution:
+        return _fingerprint_from_distribution(allow_mac)
+
+    # ==================== 旧逻辑（手写组合随机，可回退） ====================
     is_mac = allow_mac and random.random() < 0.25
 
     host = detect_host_screen()
@@ -138,6 +148,76 @@ def random_fingerprint(allow_mac: bool = False) -> dict:
         "webgl_max_texture": maxtex,
         "fonts": fonts,
     }
+
+
+def _fingerprint_from_distribution(allow_mac: bool = False) -> dict:
+    """分布模式：按真实设备分布抽一台设备，构建完整指纹。
+
+    allow_mac=False 时强制 Windows 设备（宿主一致性：Windows 宿主尽量生成
+    Windows 指纹，字体层天然自洽）。
+    """
+    from .fp_devices import random_device, coherence_check
+
+    dev = None
+    for _ in range(12):
+        d = random_device()
+        if not allow_mac and d["os"] in ("macos", "linux"):
+            continue          # 不允许时重新抽（多数是 Windows，很快命中）
+        dev = d
+        break
+    if dev is None:
+        dev = random_device()   # 兜底：接受任何设备
+
+    os_name = dev["os"]
+    brand = dev["brand"]
+    w, h, dpr = dev["screen"]["width"], dev["screen"]["height"], dev["screen"]["dpr"]
+    cores = dev["cores"]
+    memory = dev["memory"]
+
+    if os_name == "macos":
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              f"(KHTML, like Gecko) Chrome/{CHROME_VER}.0.0.0 Safari/537.36")
+        vw = w
+        vh = h - random.randint(50, 80)
+    elif os_name == "linux":
+        ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              f"(KHTML, like Gecko) Chrome/{CHROME_VER}.0.0.0 Safari/537.36")
+        vw = w
+        vh = h - random.randint(80, 130)
+    else:  # windows
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              f"(KHTML, like Gecko) Chrome/{CHROME_VER}.0.0.0 Safari/537.36")
+        vw = w
+        vh = h - random.randint(100, 160)
+    if brand == "edge":
+        ua += f" Edg/{CHROME_VER}.0.0.0"
+
+    seed = secrets.token_hex(4)
+    fp = {
+        "name": f"rnd-{seed}",
+        "ua": ua,
+        "platform": dev["platform"],
+        "ch_platform": dev["ch_platform"],
+        "platform_version": dev["platform_version"],
+        "locale": "zh-CN",
+        "languages": ["zh-CN", "zh"],
+        "timezone": "Asia/Shanghai",
+        "screen": {"width": w, "height": h, "dpr": dpr},
+        "viewport": {"width": vw, "height": max(600, vh)},
+        "cores": cores,
+        "memory": memory,
+        "touch_points": 0,
+        "canvas_noise_seed": f"rnd-{seed}",
+        "webgl_vendor": dev["gpu_vendor"],
+        "webgl_renderer": dev["gpu_renderer"],
+        "webgl_max_texture": dev["webgl_max_texture"],
+        "fonts": dev["fonts"],
+        "brand": brand,
+    }
+    bad = coherence_check(fp)
+    if bad:
+        fp["coherence_warnings"] = bad   # 记录（不阻断），便于自检审计
+    return fp
 
 
 if __name__ == "__main__":

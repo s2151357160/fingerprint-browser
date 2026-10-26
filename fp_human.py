@@ -42,11 +42,23 @@ def _curve(x0, y0, x1, y1, steps: int, rng: random.Random) -> list[tuple[float, 
 
 
 class Human:
-    """人类行为模拟器（每次实例独立随机源）"""
+    """人类行为模拟器（每次实例独立随机源）
 
-    def __init__(self, page, seed: int | None = None, preset: str = "default"):
+    trajectory: "auto"=Cursory 真人轨迹库可用则用（LGPL），否则回退贝塞尔；
+                "cursory"=强制真人轨迹；"bezier"=只用贝塞尔。
+    """
+
+    def __init__(self, page, seed: int | None = None, preset: str = "default",
+                 trajectory: str = "auto"):
         self.page = page
         self.rng = random.Random(seed)
+        self._traj = None
+        if trajectory in ("auto", "cursory"):
+            try:
+                from cursory import generate_trajectory  # noqa: PLC0415
+                self._traj = generate_trajectory
+            except Exception:  # noqa: BLE001
+                self._traj = None
         if preset == "careful":
             self.move_delay = (0.014, 0.038)
             self.pause_before_click = (0.2, 0.7)
@@ -67,7 +79,13 @@ class Human:
 
     # ---------- 鼠标 ----------
     def mouse_move(self, x: float, y: float):
-        """贝塞尔曲线移动到 (x, y)（从当前 cursor 位置出发）"""
+        """移动到 (x, y)：优先 Cursory 真人轨迹库（自带时序），回退贝塞尔"""
+        if self._traj is not None:
+            self._mouse_cursory(x, y)
+        else:
+            self._mouse_bezier(x, y)
+
+    def _cursor(self):
         try:
             pos = self.page.mouse.get_position() if hasattr(self.page.mouse, "get_position") else None
         except Exception:  # noqa: BLE001
@@ -75,18 +93,41 @@ class Human:
         if not pos:
             try:
                 pos = self.page.evaluate("() => ({x: window.__fp_cx || 0, y: window.__fp_cy || 0})")
-                sx, sy = pos["x"], pos["y"]
+                return pos["x"], pos["y"]
             except Exception:  # noqa: BLE001
-                sx, sy = 0, 0
-        else:
-            sx, sy = pos
-        for px, py in _curve(sx, sy, x, y, steps=26, rng=self.rng):
-            self.page.mouse.move(px, py)
-            self._sleep(*self.move_delay)
+                return 0, 0
+        return pos
+
+    def _mark_cursor(self, x, y):
         try:
             self.page.evaluate("(v) => { __fp_cx = v[0]; __fp_cy = v[1]; }", [x, y])
         except Exception:  # noqa: BLE001
             pass
+
+    def _mouse_cursory(self, x: float, y: float):
+        """真人轨迹库：生成带时序的轨迹点，按真实时间间隔逐点移动"""
+        sx, sy = self._cursor()
+        try:
+            pts, timings = self._traj(target_start=(sx, sy), target_end=(x, y))
+            prev_t = 0
+            for i, (px, py) in enumerate(pts):
+                self.page.mouse.move(float(px), float(py))
+                t = float(timings[i])
+                dt = (t - prev_t) / 1000.0
+                prev_t = t
+                if dt > 0:
+                    self._sleep(dt * 0.9, dt * 1.05)   # 按真实时序，±10% 抖动
+            self._mark_cursor(x, y)
+        except Exception:  # noqa: BLE001
+            self._mouse_bezier(x, y)   # 任何异常回退贝塞尔
+
+    def _mouse_bezier(self, x: float, y: float):
+        """贝塞尔曲线移动到 (x, y)（从当前 cursor 位置出发）"""
+        sx, sy = self._cursor()
+        for px, py in _curve(sx, sy, x, y, steps=26, rng=self.rng):
+            self.page.mouse.move(px, py)
+            self._sleep(*self.move_delay)
+        self._mark_cursor(x, y)
 
     # ---------- 点击 ----------
     def click(self, selector: str, index: int = 0):

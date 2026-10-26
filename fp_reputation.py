@@ -132,6 +132,54 @@ def scan(pool_nodes: list[dict], log=print, progress=lambda s: None) -> dict:
     return results
 
 
+def health_check(pool_nodes: list[dict], log=print, timeout_each: int = 6) -> dict:
+    """节点存活/可达性健康检查（不发外部 IP 分类请求）。
+
+    起临时内核逐节点切换并通过代理探测固定生成 204 端点，能拿到响应
+    即该节点可达；返回 {"alive": [...], "dead": [...], "by_node": {...}}。
+    调用方据 dead 名单标记并剔除（节点自愈）。
+    """
+    from .fp_core import Core   # 延迟导入避免环
+    alive, dead = [], []
+    by_node: dict[str, bool] = {}
+    core = Core()
+    try:
+        core.start(nodes=pool_nodes)
+        names = core.node_names()
+        for i, name in enumerate(names):
+            log(f"[健康] 检查 {i + 1}/{len(names)}: {name}")
+            if not core.select_node(name):
+                dead.append(name)
+                by_node[name] = False
+                continue
+            ok = _reachable(core.proxy_url, timeout_each)
+            by_node[name] = ok
+            (alive if ok else dead).append(name)
+            if not ok:
+                log(f"[健康] 节点不可达: {name}")
+    finally:
+        try:
+            core.stop()
+        except Exception:
+            pass
+    return {"alive": alive, "dead": dead, "by_node": by_node}
+
+
+def _reachable(proxy_url: str | None, timeout: int) -> bool:
+    if not proxy_url:
+        return False
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    for url in ("http://www.gstatic.com/generate_204", "http://api.ipify.org"):
+        try:
+            with opener.open(url, timeout=timeout) as r:
+                if r.status in (200, 204):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 class ReputationStore:
     """线程安全的信誉缓存（模块级单例 store）"""
 
@@ -160,6 +208,20 @@ class ReputationStore:
             self._data.update(results)
         self.save()
 
+    def set_alive(self, name: str, alive: bool):
+        """标记节点存活/失活（健康检查结果）。失活节点不再被优选/同国路由选中。"""
+        with self._lock:
+            v = self._data.get(name) or {}
+            v["alive"] = bool(alive)
+            if not alive:
+                v["last_dead_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._data[name] = v
+        self.save()
+
+    def is_alive(self, name: str) -> bool:
+        with self._lock:
+            return (self._data.get(name) or {}).get("alive", True)  # 缺省视为存活
+
     def get(self, name: str) -> dict | None:
         with self._lock:
             return self._data.get(name)
@@ -179,13 +241,16 @@ class ReputationStore:
             return []   # 空国家参数：不匹配任何节点（含未扫描的 country="" 节点）
         with self._lock:
             return [n for n in all_names
-                    if (self._data.get(n) or {}).get("country", "").upper() == country.upper()]
+                    if (self._data.get(n) or {}).get("alive", True) and
+                    (self._data.get(n) or {}).get("country", "").upper() == country.upper()]
 
     def preferred_names(self, all_names: list[str]) -> list[str]:
-        """信誉达标（>=2 住宅/移动）且延迟可接受（<800ms，未测不计限制）的节点名"""
+        """信誉达标（>=2 住宅/移动）且存活、延迟可接受（<800ms，未测不计限制）的节点名"""
         with self._lock:
             out = []
             for n in all_names:
+                if not (self._data.get(n) or {}).get("alive", True):
+                    continue
                 v = self._data.get(n) or {}
                 if v.get("score", -1) >= 2:
                     lat = v.get("latency_ms")

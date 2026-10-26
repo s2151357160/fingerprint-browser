@@ -40,6 +40,23 @@ LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
+    # 借鉴 patchright Command Flags 修补：命令行层禁止非代理 UDP（WebRTC 真实 IP 防泄漏），
+    # 与注入层 STUN/TURN 剥离双重保险（ICMP/UDP 不经 HTTP 代理会直连真实出口）
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+]
+
+# 显式剔除 Playwright 默认参数中会留下"自动化痕迹"的项（patchright 修补清单）：
+#   --enable-automation        -> navigator.webdriver / window.chrome 自动化形态
+#   --disable-popup-blocking   -> 真实浏览器弹窗拦截开启
+#   --disable-component-update -> 避免被识别为 stealth driver
+#   --disable-default-apps     -> 恢复默认应用
+#   --disable-extensions       -> 恢复扩展能力
+REMOVED_DEFAULT_ARGS = [
+    "--enable-automation",
+    "--disable-popup-blocking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-extensions",
 ]
 
 # UA 版本兜底（launch 时会以实际内核版本自动校正）
@@ -139,13 +156,14 @@ _INIT_JS = r"""
   'use strict';
 
   /* ==================== 种子派生确定性噪声 ==================== */
+  var __NOISE = __NOISE_FLAG__;   /* canvas_noise 模板字段开关 */
   var _h = 2166136261;
   var _seed = '__SEED__';
   for (var i = 0; i < _seed.length; i++) {
     _h = ((_h ^ _seed.charCodeAt(i)) * 16777619) >>> 0;
   }
   var SEED = _h >>> 0;
-  var jitter = function (i) { return (SEED + i * 2654435761) >>> 0; };
+  var jitter = function (i) { return __NOISE ? (SEED + i * 2654435761) >>> 0 : 0; };
 
   /* ==================== native toString 伪装 ==================== */
   var _fakeNative = new Set();
@@ -387,6 +405,7 @@ _INIT_JS = r"""
   });
   var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
   var applyNoise = function (img) {
+    if (!__NOISE) return img;   /* canvas_noise=false：保持原生像素（Camoufox 反噪声哲学） */
     var d = img.data;
     for (var i = 0; i < d.length; i++) {
       d[i] = (d[i] + ((jitter(i) % 3) - 1) + 256) % 256;
@@ -560,6 +579,8 @@ _DEEP_JS = r"""
   /*__DEEP_SCREEN__*/
   /*__DEEP_NET__*/
   /*__DEEP_QUOTA__*/
+  /*__DEEP_SHADOW__*/
+  /*__DEEP_CDP__*/
 })();
 """
 
@@ -568,7 +589,8 @@ def _deep_js(fp: dict) -> str:
     """根据指纹字段编译深度伪装片段（无字段 → 空字符串，行为与原生一致）"""
     slots = {"__DEEP_VENDOR__": "", "__DEEP_NO_CHROME__": "",
              "__DEEP_NO_UAD__": "", "__DEEP_SCREEN__": "",
-             "__DEEP_NET__": "", "__DEEP_QUOTA__": ""}
+             "__DEEP_NET__": "", "__DEEP_QUOTA__": "",
+             "__DEEP_SHADOW__": "", "__DEEP_CDP__": ""}
 
     vendor = fp.get("vendor")
     if vendor is not None:
@@ -626,6 +648,34 @@ def _deep_js(fp: dict) -> str:
             f"else if (navigator.storage) {{ navigator.storage.estimate = _est; }} "
             f"}} catch (e) {{}}")
 
+    # 借鉴 fingerprint-chromium：fakeShadowRoot 穿透 closed shadow root
+    if fp.get("fake_shadow") is True:
+        slots["__DEEP_SHADOW__"] = (
+            "try { "
+            "var _origAttach = Element.prototype.attachShadow; "
+            "var _closedRoots = new WeakMap(); "
+            "Element.prototype.attachShadow = function (init) { "
+            "var root = _origAttach.call(this, init); "
+            "if (init && init.mode === 'closed') { _closedRoots.set(this, root); } "
+            "return root; }; "
+            "Object.defineProperty(Element.prototype, 'fakeShadowRoot', { "
+            "configurable: true, get: function () { "
+            "if (!(this instanceof Element)) return null; "
+            "if (this.shadowRoot) return this.shadowRoot; "
+            "var r = _closedRoots.get(this); return r || null; } }); "
+            "} catch (e) {}")
+
+    # CDP 残留清理：老 chromedriver 泄漏的 cdc_ 变量 + 兜底 window.cdc_ 清理
+    if fp.get("cdp_cleanup") is True:
+        slots["__DEEP_CDP__"] = (
+            "try { "
+            "for (var k in window) { if (k.indexOf('cdc_') === 0) { "
+            "try { delete window[k]; } catch (e) {} } } "
+            "var _cdc = Object.getOwnPropertyNames(window).filter(function (n) { "
+            "return n.indexOf('cdc_') === 0; }); "
+            "_cdc.forEach(function (n) { try { delete window[n]; } catch (e) {} }); "
+            "} catch (e) {}")
+
     if not any(slots.values()):
         return ""
     js = _DEEP_JS
@@ -634,16 +684,88 @@ def _deep_js(fp: dict) -> str:
     return js
 
 
+# ==================== 非 Chromium 轻量注入（Firefox / WebKit） ====================
+# Chromium 版深注入依赖 NavigatorUAData / WebGL / Audio / Canvas 等原型细节，
+# 与 firefox/webkit 引擎结构不通用。非 chromium 引擎改用轻量注入：
+#   - navigator.webdriver=false（Playwright/firefox 会暴露任真值）
+#   - plugins / mimeTypes 归零无痕（真实 Firefox 也常为 0 个表项）
+#   - 其余 UA/locale/viewport/geolocation 由 Playwright context 级参数天然覆盖
+_LIGHT_JS = r"""
+(function () {
+  'use strict';
+  var nativeFn = function (name, fn) {
+    try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+    return fn;
+  };
+  var setProp = function (proto, key, val) {
+    try {
+      Object.defineProperty(proto, key, {
+        get: nativeFn(key, function () { return val; }),
+        set: undefined, enumerable: true, configurable: true,
+      });
+    } catch (e) {}
+  };
+  setProp(Navigator.prototype, 'webdriver', false);
+  try {
+    var pd = [], md = [];
+    var pArr = Object.create(PluginArray.prototype);
+    Object.defineProperty(pArr, 'length', {
+      get: nativeFn('length', function () { return 0; }), enumerable: true, configurable: true });
+    pArr.item = nativeFn('item', function () { return null; });
+    pArr.namedItem = nativeFn('namedItem', function () { return null; });
+    var mArr = Object.create(MimeTypeArray.prototype);
+    Object.defineProperty(mArr, 'length', {
+      get: nativeFn('length', function () { return 0; }), enumerable: true, configurable: true });
+    mArr.item = nativeFn('item', function () { return null; });
+    mArr.namedItem = nativeFn('namedItem', function () { return null; });
+    setProp(Navigator.prototype, 'plugins', pArr);
+    setProp(Navigator.prototype, 'mimeTypes', mArr);
+  } catch (e) {}
+})();
+"""
+
+
+def browser_type(fp: dict) -> str:
+    """取指纹模板声明的浏览器引擎（缺省 chromium）。"""
+    return (fp.get("browser_type") or "chromium").lower()
+
+
+def build_init_script_light(fp: dict) -> str:
+    """非 chromium 引擎的轻量注入脚本。"""
+    return _LIGHT_JS
+
+
+def _client_extra_headers(fp: dict) -> dict:
+    """chromium 引擎的完整请求头链路（Sec-CH-UA 三件套 + 常规 Accept）。
+
+    说明：Chromium 不允许多 CDP 覆盖 sec-fetch-*（由网络栈控制），
+    这部分保持浏览器原生；此处补齐 JS/fetch 层可覆盖的头，让
+    XHR/fetch 请求在头域上更贴近真实浏览器。
+    """
+    base = _client_hints(fp)
+    # 常规头：Chromium 允许 setExtraHTTPHeaders 覆盖，且不影响指纹注入
+    base["Accept"] = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,*/*;q=0.8")
+    base["Accept-Language"] = fp.get("locale", "en-US")
+    base["Upgrade-Insecure-Requests"] = "1"
+    return base
+
+
 def build_init_script(fp: dict) -> str:
     """把指纹编译为页面注入脚本（页面任何脚本执行之前运行）。
 
+    chromium 引擎走完整深注入；firefox/webkit 走轻量注入。
     噪声全部由 canvas_noise_seed 派生：同一指纹每次启动噪声恒定，
     不同指纹噪声不同 —— 满足"稳定但不重复"的指纹伪装原则。
     """
+    if browser_type(fp) != "chromium":
+        return build_init_script_light(fp)
+
     major = fp.get("chrome_major", _FALLBACK_VER)
     full_ver = fp.get("chrome_full_ver", f"{major}.0.0.0")
     brands, full_list = _uad_brands(fp)
     js = (_INIT_JS
+          .replace("__NOISE_FLAG__", "true" if fp.get("canvas_noise") is not False else "false")
           .replace("__SEED__", fp.get("canvas_noise_seed", fp.get("name", "default")).replace("\\", "\\\\").replace("'", "\\'"))
           .replace("__UA__", fp["ua"].replace("\\", "\\\\").replace("'", "\\'"))
           .replace("__PLATFORM__", fp["platform"])
@@ -684,6 +806,7 @@ def _resolve_proxy(proxy: str | None) -> str | None:
 
 
 def _new_context(browser, fp: dict, proxy: str | None = None, storage_state: dict | None = None):
+    bt = browser_type(fp)
     kwargs = {
         "user_agent": fp["ua"],                      # UA（与注入脚本一致，双保险）
         "locale": fp["locale"],                      # 联动 Accept-Language
@@ -692,8 +815,18 @@ def _new_context(browser, fp: dict, proxy: str | None = None, storage_state: dic
                       "height": fp["viewport"]["height"]},
         "device_scale_factor": fp["screen"]["dpr"],
         "proxy": {"server": proxy, "bypass": "localhost,127.0.0.1,<local>"} if proxy else None,
-        "extra_http_headers": _client_hints(fp),     # Sec-CH-UA 三件套（真实 Chrome 必发）
     }
+    # Chromium 引擎：Sec-CH-UA 三件套 + 常规 Accept（firefox/webkit 不适用 CH 头）
+    if bt == "chromium":
+        kwargs["extra_http_headers"] = _client_extra_headers(fp)
+    else:
+        # 非 chromium 引擎：仅补 Accept 与语言（CH 头是 chromium 专有）
+        kwargs["extra_http_headers"] = {
+            "Accept-Language": fp.get("locale", "en-US"),
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,*/*;q=0.8"),
+            "Upgrade-Insecure-Requests": "1",
+        }
     # 环境人设地理坐标（与 IP 国家一致；不预授权定位权限——真实用户多数手动允许）
     geo = fp.get("geolocation")
     if isinstance(geo, dict) and geo.get("latitude") is not None:
@@ -707,6 +840,21 @@ def _new_context(browser, fp: dict, proxy: str | None = None, storage_state: dic
     return context
 
 
+def _launch_one(p, fp: dict, headless: bool):
+    """按指纹模板的 browser_type 启动对应引擎。
+
+    chromium：剔除自动化痕迹参数（patchright 修补清单）；
+    firefox / webkit：不注入 chromium 专属参数（会报错或无效）。
+    """
+    bt = browser_type(fp)
+    if bt == "firefox":
+        return p.firefox.launch(headless=headless)
+    if bt == "webkit":
+        return p.webkit.launch(headless=headless)
+    return p.chromium.launch(headless=headless, args=LAUNCH_ARGS,
+                             ignore_default_args=REMOVED_DEFAULT_ARGS)
+
+
 def launch(fp: dict, proxy: str | None = None, headless: bool = False,
            storage_state: dict | None = None):
     """启动带指定指纹的浏览器实例。
@@ -714,13 +862,14 @@ def launch(fp: dict, proxy: str | None = None, headless: bool = False,
     返回 (playwright, browser, context, page)；用完调用 playwright.stop()。
     proxy: None 不用代理 / "auto" 自动探测本机梯子 / 或具体 "socks5://host:port"。
     storage_state: 账号档案登录态（cookie+localStorage），再次登录时完全还原。
+    引擎由指纹模板 browser_type 决定（缺省 chromium；可 firefox / webkit）。
     """
     p = sync_playwright().start()
     try:
-        # 显式剔除 Playwright 默认的 --enable-automation：它会让 window.chrome 等产生自动化痕迹，
-        # 是 Cloudflare Turnstile 等验证引擎的重要判定信号（webdriver 已由注入脚本伪为 false）
-        browser = p.chromium.launch(headless=headless, args=LAUNCH_ARGS,
-                                    ignore_default_args=["--enable-automation"])
+        # 显式剔除 Playwright 默认参数中的自动化痕迹清单（patchright Command Flags 修补）：
+        #   --enable-automation 会让 window.chrome 等产生自动化形态，是 Cloudflare Turnstile 等
+        #   验证引擎的重要判定信号（webdriver 已由注入脚本伪为 false）；其余各项避免被识别为 stealth driver
+        browser = _launch_one(p, fp, headless)
         # UA 版本随实际内核校正（零成本：browser.version 现成）
         fp = sync_ua(fp, browser.version)
         context = _new_context(browser, fp, _resolve_proxy(proxy), storage_state)
@@ -791,16 +940,36 @@ _PROBE_JS = """() => {
 """
 
 
+_LIGHT_PROBE_JS = """() => {
+  return {
+    ua: navigator.userAgent,
+    platform: navigator.platform,
+    webdriver: navigator.webdriver,
+    language: navigator.language,
+    languages: navigator.languages,
+    cores: navigator.hardwareConcurrency,
+    screenW: screen.width,
+    screenH: screen.height,
+    pluginsLen: (navigator.plugins || []).length,
+  };
+}
+"""
+
+
 def verify(fp: dict) -> dict:
-    """headless 快速校验：读取浏览器实际暴露的指纹，返回供比对。"""
+    """headless 快速校验：读取浏览器实际暴露的指纹，返回供比对。
+
+    chromium 引擎采集完整信号；firefox/webkit 采集轻量信号（深注入
+    仅 chromium 适用）。
+    """
+    probe = _PROBE_JS if browser_type(fp) == "chromium" else _LIGHT_PROBE_JS
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS,
-                                    ignore_default_args=["--enable-automation"])
+        browser = _launch_one(p, fp, True)
         fp = sync_ua(fp, browser.version)
         context = _new_context(browser, fp)
         page = context.new_page()
         page.goto("about:blank")
-        actual = page.evaluate(_PROBE_JS)
+        actual = page.evaluate(probe)
         browser.close()
     return actual
 
